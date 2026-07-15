@@ -45,6 +45,7 @@ Chat/
 │   └── test_server.py       # Unit tests (python -m unittest discover tests)
 ├── server_data.json         # Auto-generated on first server run
 ├── server_data_history.json # Persisted text messages and shared files
+├── server_data_profiles.json# User profiles (bio + avatar/banner images)
 ├── README.md                # This file
 └── GUIDE.md                 # End-user guide
 ```
@@ -230,17 +231,19 @@ No command-line arguments. The connect dialog opens automatically on launch.
 Message content is encrypted client-side with **Fernet** (AES-128-CBC + HMAC-SHA256). The key is derived deterministically from the server password via **PBKDF2-HMAC-SHA256**:
 
 ```
-key = PBKDF2HMAC(SHA256, length=32, salt=b"chat_platform_v2", iterations=600_000)
+key = PBKDF2HMAC(SHA256, length=32, salt=<per-server salt>, iterations=600_000)
       → base64url-encode → Fernet key
 ```
+
+The salt is random per server, generated on first start (`kdf_salt` in `server_data.json`) and delivered to clients in `auth_result` — so identical passwords on different servers derive different keys and precomputed key tables don't transfer. Clients fall back to the legacy fixed salt (`chat_platform_v2`) when connecting to an older server that doesn't send one. Changing or deleting `kdf_salt` makes previously stored history undecryptable.
 
 All clients on a server must run the same client version: the salt and iteration count are part of the key derivation, so mixed versions derive different keys and show `[unable to decrypt]`.
 
 By default the key is derived from the **server password**, so all clients that can log in share it. The connect dialog also has an optional **Encryption Key** field: when set (and identical on every client), the key is derived from that passphrase instead, which is never sent to the server — so the operator, who knows the server password, still cannot derive the message key. The server only ever sees ciphertext either way.
 
-Encrypted message types: `room_message` content and `file_message` content (entire payload JSON). Metadata (room name, username, timestamp) and server-originated system messages remain plaintext.
+Encrypted message types: `room_message` content and `file_message` content (entire payload JSON). Plaintexts are padded to 256-byte buckets before encryption (`pad_plaintext`), so ciphertext length only reveals a coarse size bucket rather than the exact message length. Metadata (room name, username, timestamp), server-originated system messages, and **user profiles** (bio, avatar, banner) remain plaintext — profiles are stored and served by the server by design, so the operator can read them.
 
-`derive_key(secret)` and the `Fernet` instance are created in `ChatWindow._connect()` once per session.
+The `Fernet` instance is created in the `auth_result` handler once the server's `kdf_salt` is known.
 
 ### Markdown
 
@@ -284,6 +287,7 @@ Typing `/command` in the message input sends an `admin_command` message to the s
 | `/online` | Everyone | List currently connected users |
 | `/listusers` | Everyone | List all registered users |
 | `/listrooms` | Everyone | List all rooms |
+| `/setmypassword <new_password>` | Everyone | Change your own login password |
 | `/kick <username>` | Admins | Kick a user from the server |
 | `/adduser <username> <pass>` | Admins | Register a new user |
 | `/removeuser <username>` | Admins | Delete a user |
@@ -420,12 +424,20 @@ All messages are UTF-8 JSON objects. Every object has a `"type"` field.
 | `list_rooms` | — | Request the current room list |
 | `list_users` | `room` | Request the user list for a room |
 | `admin_command` | `command`, `args` | Execute an admin command; server responds with `admin_result` |
+| `get_profile` | `username` | Request a user's profile card; server responds with `profile` |
+| `update_profile` | `bio`, `avatar` (base64 or null), `banner` (base64 or null) | Update the sender's own profile; server responds with `profile_update_result` |
+| `edit_message` | `room`, `id`, `content` | Replace one of your own text messages (server verifies ownership against its recent-message index) |
+| `delete_message` | `room`, `id` | Delete a message; allowed for the author or an admin |
+| `react` | `room`, `id`, `emoji` | Toggle an emoji reaction on a message |
+| `typing` | `room` | Typing ping; broadcast to the room (throttled client-side and rate-limited server-side) |
+| `pin_message` / `unpin_message` | `room`, `id` | Pin or unpin a text message (admin only) |
+| `get_pins` | `room` | Request the room's pinned messages; server responds with `pins_list` |
 
 ### Server → Client
 
 | `type` | Additional fields | Description |
 |---|---|---|
-| `auth_result` | `success` (bool), `message`, and on success `rooms`, `max_file_mb`, `is_admin`, `roles` (name→colour), `your_roles` | Response to `auth` |
+| `auth_result` | `success` (bool), `message`, and on success `kdf_salt`, `rooms`, `max_file_mb`, `is_admin`, `roles` (name→colour), `your_roles` | Response to `auth` |
 | `rooms_list` | `rooms` (list); optionally `roles`, `your_roles` | Room list the user may access, sent on request or when rooms/roles change |
 | `users_list` | `room`, `users` (list), `user_roles` (name→roles), `roles` (name→colour) | User list for a room, with role badges |
 | `room_message` | `room`, `username`, `content`, `timestamp`, `historical` (bool) | Encrypted text message |
@@ -439,6 +451,14 @@ All messages are UTF-8 JSON objects. Every object has a `"type"` field.
 | `history_start` | `room` | Signals the start of replayed history for a room |
 | `history_end` | `room` | Signals the end of replayed history for a room |
 | `admin_result` | `success` (bool), `message` | Response to `admin_command` |
+| `profile` | `username`, `bio`, `avatar` (base64 or null), `banner` (base64 or null), `roles`, `is_admin` | Response to `get_profile`, and broadcast to everyone when a user updates their own profile |
+| `profile_update_result` | `success` (bool), `message` | Response to `update_profile` |
+| `message_edited` | `room`, `id`, `content` | A message was edited; clients re-render it with an "(edited)" marker |
+| `message_deleted` | `room`, `id` | A message was deleted; clients remove the row |
+| `reaction_update` | `room`, `id`, `reactions` (emoji→usernames) | A message's reactions changed |
+| `typing` | `room`, `username` | Someone is typing in the room |
+| `room_activity` | `room` | Content-free unread ping: a message was posted in a room you have access to but aren't in |
+| `pins_list` | `room`, `pins` (message entries) | Response to `get_pins` |
 | `error` | `message` | Protocol error response |
 
 Timestamps are ISO-8601 UTC (e.g. `2026-07-15T14:09:57+00:00`); the client converts them to local time for display.
@@ -450,7 +470,8 @@ Timestamps are ISO-8601 UTC (e.g. `2026-07-15T14:09:57+00:00`); the client conve
 - Passwords are hashed at rest with argon2id (if `argon2-cffi` is installed) or PBKDF2-HMAC-SHA256 (600 000 iterations, per-hash random salt), compared in constant time. Weaker/legacy hashes are upgraded automatically on the next successful login.
 - The auth message travels inside the WebSocket connection. **Without TLS it is plaintext on the wire** — run the server with `--certfile`/`--keyfile` and tick *Use TLS* in the client, or tunnel over a VPN (Tailscale/WireGuard) or SSH.
 - Failed logins return a uniform `Invalid username or password`, so the auth endpoint does not reveal which usernames exist.
-- Brute-force protection: repeated failed logins from one IP are blocked for a configurable period (`ratelimit` commands; default 5 failures / 60 s window / 300 s block).
+- Brute-force protection: repeated failed logins from one IP are blocked for a configurable period (`ratelimit` commands; default 5 failures / 60 s window / 300 s block). Active blocks are persisted in `server_data.json` (`blocked_ips`), so a server restart does not clear them.
+- User profiles (bio, avatar, banner) are stored in plaintext in `server_data_profiles.json` and are readable by the server operator and every authenticated user — don't put secrets in them. Profile updates and reads are rate-limited per connection.
 - The server password acts as a gate preventing unknown clients from even attempting user authentication.
 - **Message content is encrypted client-side** with Fernet (AES-128-CBC + HMAC-SHA256). The server never sees plaintext message bodies or file contents.
 - The encryption key is symmetric and shared among all clients who know the server password, derived via PBKDF2-HMAC-SHA256 (600 000 iterations). This is **group encryption, not per-user end-to-end encryption**: anyone who knows the server password (including the server operator) can derive the key. Metadata (usernames, room names, timestamps) is visible to the server.
