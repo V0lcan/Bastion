@@ -22,6 +22,8 @@ Open a terminal in the `Chat` folder and run:
 python server.py
 ```
 
+> **Prefer a graphical console?** Run `python server.py --gui` instead for a point-and-click admin window (users, rooms, roles, settings, and a live log). See [Using the server GUI](#using-the-server-gui) below. Everything in this CLI walkthrough has an equivalent there.
+
 On first run the server creates `server_data.json` with one room (`General`) and a default server password of `changeme`. You will see:
 
 ```
@@ -89,6 +91,8 @@ The connect dialog opens automatically.
 | Server Password | The password set with `setpassword` on the server |
 | Username | Your account name (must be added by the server host) |
 | Your Password | Your account password |
+| Encryption Key | *Optional.* A shared passphrase for message encryption. Leave blank to use the server password. If your group sets one, **everyone must type the exact same value** — and the server operator then cannot read your messages. |
+| Use TLS (wss://) | Tick if the server was started with `--certfile`/`--keyfile` |
 
 Press **Enter** or click **Connect**.
 
@@ -120,8 +124,10 @@ The **🔒 Encrypted** indicator in the top bar confirms that messages are being
 - **USERS panel** — shows everyone currently in the active room. Your name is prefixed with `@`.
 - **Chat area** — messages appear in real time. Your username is shown in a different colour from others'.
 - **System messages** — shown in green italics (joins, leaves, server notices).
-- **Send** — type in the box and press **Enter** or click **Send**.
-- **Message history** — press **Up / Down** arrow in the message box to cycle through previously sent messages.
+- **Roles** — if the server host has given you or others a role, it appears as a small coloured badge next to the name in the user list and in chat. Some rooms may only be visible to certain roles.
+- **Send** — type in the box and press **Enter** or click **Send**. Use **Shift+Enter** for a new line within a message.
+- **Attachments** — click **＋** to send an image or file. Images preview inline, text files show a scrollable preview, and everything else appears as a card with a **Save** button. Shared files remain in the room for people who join later.
+- **Message history** — press **Up / Down** arrow (on the first/last line) in the message box to cycle through previously sent messages.
 
 ### 4. Switching rooms
 
@@ -171,6 +177,35 @@ When a room is removed, anyone currently in it receives a system message and the
 
 Sends the user a "you have been kicked" system message and closes their connection. They can reconnect immediately — there is no ban.
 
+### Roles and private rooms
+
+By default every room is open to everyone who can log in. To make a room private, create a **role** and give it access to that room — only users with the role (and admins) will see or be able to join it.
+
+```
+> addroom Staff                 Create the room
+> role add moderator #eb459e    Create a role (colour is optional)
+> role rooms moderator Staff     Let the role into the Staff room
+> grantrole alice moderator      Give alice the role
+```
+
+Now `Staff` is hidden from everyone except admins and users with the `moderator` role. Alice sees it appear in her sidebar the moment you run `grantrole` — no reconnect needed. Roles show up as coloured badges next to a user's name in the user list and in chat.
+
+```
+> role list                      Show roles, their rooms, and members
+> revokerole alice moderator     Remove the role (alice loses access immediately)
+> role del moderator             Delete the role entirely
+```
+
+A room stops being private if no role grants it (for example after `role del`), reverting to open access.
+
+### Shared files stay in the chat
+
+Files and images people send are saved on the server and shown again to anyone who joins the room later, so they don't vanish when the sender disconnects. This is on by default. To turn it off (or manage text history), use the GUI Settings tab or:
+
+```
+> history status                 Show what is being kept
+```
+
 ### Changing the server password
 
 ```
@@ -178,6 +213,30 @@ Sends the user a "you have been kicked" system message and closes their connecti
 ```
 
 Takes effect for the next connection attempt. Existing sessions are not affected.
+
+---
+
+## Using the server GUI
+
+Launch the graphical admin console instead of the CLI:
+
+```
+python server.py --gui
+```
+
+The server starts immediately and a window opens with five tabs:
+
+| Tab | What you can do |
+|---|---|
+| **Dashboard** | Watch the live server log; see the listening address and how many users are online; Stop/Start the server. |
+| **Users** | See every account with an online dot and admin/role badges. Add or remove users, set a password, kick, grant/revoke roles, toggle admin. |
+| **Rooms** | See all rooms with live occupancy and whether each is *open* or *restricted*. Add or remove rooms. |
+| **Roles** | Create and delete roles (with a colour), choose which rooms each role grants, and see who has it. |
+| **Settings** | Toggle text history, file persistence, and login rate-limiting; set the max file size; change the server password; block and unblock IPs. |
+
+Select a user or role first, then use the buttons underneath the list to act on it. Changes take effect immediately and are pushed to connected clients live, exactly like the CLI commands.
+
+The `--gui` option needs `PyQt6` installed (the same package the client uses). The headless `python server.py` needs only `websockets`.
 
 ### Stopping the server
 
@@ -232,7 +291,21 @@ If the server is running on a home network, you need to:
 2. Share your **public** IP address (not your local `192.168.x.x` one) with friends.
 3. Make sure the port is allowed in Windows Firewall.
 
-For a more secure setup, run the server over a VPN (e.g. Tailscale or WireGuard) so the traffic is encrypted end-to-end.
+For a more secure setup, do one (or both) of the following:
+
+### Option A — TLS (wss://)
+
+If you have a domain name and a certificate (e.g. from Let's Encrypt), start the server with:
+
+```
+python server.py --certfile fullchain.pem --keyfile privkey.pem
+```
+
+Clients then tick **Use TLS (wss://)** in the connect dialog and enter the domain name as the Server IP. The certificate must be valid for the hostname the clients type in — self-signed certificates will be rejected unless the clients install your CA.
+
+### Option B — VPN
+
+Run the server over a VPN (e.g. Tailscale or WireGuard) so all traffic is encrypted at the network layer without needing a certificate.
 
 ---
 
@@ -242,8 +315,8 @@ For a more secure setup, run the server over a VPN (e.g. Tailscale or WireGuard)
 |---|---|---|
 | "Connection Error" on connect | Wrong IP, port, or server not running | Double-check IP and port; confirm server is running |
 | "Invalid server password" | Wrong server password | Ask the server host for the correct password |
-| "User not found" | Account not created | Ask the server host to run `adduser` |
-| "Invalid password" | Wrong user password | Check with the server host |
+| "Invalid username or password" | Account not created, or wrong user password | Check with the server host; they can create accounts with `adduser` |
+| "Too many failed login attempts" | Your IP was temporarily blocked after repeated failures | Wait for the block to expire, or ask the host to run `unblock <ip>` |
 | "User already connected" | You have another session open | Disconnect the other client first |
 | Server prints `[!] Client error` | Usually a network drop | Generally safe to ignore |
 | `websockets` not found | Package not installed | Run `pip install websockets PyQt6 cryptography` |
