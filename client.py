@@ -11,6 +11,7 @@ import mimetypes
 import re
 import html
 import zlib
+import time
 
 _missing = []
 try:
@@ -19,12 +20,16 @@ try:
         QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit,
         QListWidget, QListWidgetItem, QFrame, QFormLayout,
         QMessageBox, QScrollArea, QFileDialog, QCheckBox, QPlainTextEdit,
+        QTabWidget, QMenu, QSystemTrayIcon,
     )
     from PyQt6.QtCore import (
         Qt, QThread, QObject, pyqtSignal, pyqtSlot,
-        QTimer, QBuffer, QSize,
+        QTimer, QBuffer, QSize, QPoint, QSettings,
     )
-    from PyQt6.QtGui import QFont, QColor, QPixmap, QMovie, QTextCursor
+    from PyQt6.QtGui import (
+        QFont, QColor, QPixmap, QMovie, QTextCursor, QPainter, QPainterPath,
+        QGuiApplication, QIcon, QImage,
+    )
 except ImportError:
     _missing.append("PyQt6")
 
@@ -75,6 +80,9 @@ TEXT_EXTS = frozenset({
 TEXT_PREVIEW_MAX_LINES = 200
 TEXT_PREVIEW_MAX_CHARS = 8000
 
+# Emoji offered in the message context menu's React submenu
+REACTION_EMOJI = ["👍", "❤️", "😂", "😮", "😢", "🎉", "👀", "✅"]
+
 
 def is_text_file(mimetype: str, filename: str) -> bool:
     if mimetype.startswith("text/") or mimetype in TEXT_MIME_EXTRA:
@@ -105,6 +113,66 @@ AVATAR_COLORS = [
 
 def avatar_color(username: str) -> str:
     return AVATAR_COLORS[zlib.crc32(username.encode()) % len(AVATAR_COLORS)]
+
+
+# ── Profile images ───────────────────────────────────────────────────────
+# Kept intentionally small so profiles fit comfortably in the server's JSON
+# config; PROFILE_IMAGE_MAX_B64 below must stay >= what these produce.
+PROFILE_AVATAR_PX = 128
+PROFILE_BANNER_W = 480
+PROFILE_BANNER_H = 160
+PROFILE_BIO_MAX_CHARS = 300
+PROFILE_IMAGE_MAX_B64 = 400_000
+
+
+def cropped_pixmap(px: QPixmap, w: int, h: int) -> QPixmap:
+    """Scale px to cover a w×h box, then center-crop to exactly that size."""
+    scaled = px.scaled(
+        w, h, Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+        Qt.TransformationMode.SmoothTransformation,
+    )
+    x = max(0, (scaled.width() - w) // 2)
+    y = max(0, (scaled.height() - h) // 2)
+    return scaled.copy(x, y, w, h)
+
+
+def circular_pixmap(px: QPixmap, size: int) -> QPixmap:
+    cropped = cropped_pixmap(px, size, size)
+    out = QPixmap(size, size)
+    out.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(out)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    path = QPainterPath()
+    path.addEllipse(0, 0, size, size)
+    painter.setClipPath(path)
+    painter.drawPixmap(0, 0, cropped)
+    painter.end()
+    return out
+
+
+def pixmap_to_b64(px: QPixmap, quality: int = 85) -> str:
+    buf = QBuffer()
+    buf.open(QBuffer.OpenModeFlag.WriteOnly)
+    px.save(buf, "JPEG", quality)
+    return base64.b64encode(bytes(buf.data())).decode()
+
+
+_PROFILE_IMAGE_MAX_DIM = 2048   # reject decompression bombs (tiny file, huge canvas)
+
+
+def b64_to_pixmap(b64: str | None) -> QPixmap | None:
+    if not b64 or len(b64) > PROFILE_IMAGE_MAX_B64:
+        return None
+    try:
+        raw = base64.b64decode(b64)
+    except Exception:
+        return None
+    px = QPixmap()
+    if not px.loadFromData(raw):
+        return None
+    if px.width() > _PROFILE_IMAGE_MAX_DIM or px.height() > _PROFILE_IMAGE_MAX_DIM:
+        return None
+    return px
 
 
 def format_timestamp(ts: str | None) -> str:
@@ -252,20 +320,42 @@ def markdown_to_html(text: str) -> str:
 # Encryption
 # ---------------------------------------------------------------------------
 
-_KDF_SALT = b"chat_platform_v2"
+# Fallback salt for servers that predate per-server salts. Newer servers
+# send a random per-server salt in auth_result, which prevents cross-server
+# rainbow-table precomputation of keys from common passwords.
+_LEGACY_KDF_SALT = b"chat_platform_v2"
 # NOTE: all clients on a server must use the same salt + iteration count,
 # otherwise they derive different keys and see "[unable to decrypt]".
 _KDF_ITERATIONS = 600_000
 
 
-def derive_key(server_password: str) -> bytes:
+def derive_key(server_password: str, salt: bytes = _LEGACY_KDF_SALT) -> bytes:
     kdf = PBKDF2HMAC(
         algorithm=hashes.SHA256(),
         length=32,
-        salt=_KDF_SALT,
+        salt=salt,
         iterations=_KDF_ITERATIONS,
     )
     return base64.urlsafe_b64encode(kdf.derive(server_password.encode()))
+
+
+# Message padding: round each plaintext up to a bucket boundary before
+# encryption so ciphertext length only reveals a coarse size bucket, not the
+# exact message length. 0x80 marks where the real content ends (ISO/IEC
+# 7816-4 style), so padding strips unambiguously after decryption.
+_PAD_BLOCK = 256
+
+
+def pad_plaintext(data: bytes) -> bytes:
+    n = (-(len(data) + 1)) % _PAD_BLOCK
+    return data + b"\x80" + b"\x00" * n
+
+
+def unpad_plaintext(data: bytes) -> bytes:
+    i = data.rfind(b"\x80")
+    if i != -1 and not any(data[i + 1:]):
+        return data[:i]
+    return data  # unpadded message from an older client
 
 
 # ---------------------------------------------------------------------------
@@ -608,6 +698,159 @@ def make_role_chip(name: str, color: str) -> QLabel:
 
 
 # ---------------------------------------------------------------------------
+# Hover profile card
+# ---------------------------------------------------------------------------
+
+class ProfileCard(QFrame):
+    """Frameless popup shown when hovering a user in the sidebar list:
+    banner, avatar, name, role chips, and their bio."""
+
+    CARD_W = 260
+    BANNER_H = 74
+    AVATAR_SIZE = 56
+
+    def __init__(self):
+        super().__init__(None, Qt.WindowType.ToolTip | Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setFixedWidth(self.CARD_W)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        card = QFrame()
+        card.setObjectName("card")
+        card.setStyleSheet(
+            f"QFrame#card {{ background-color: {ELEV}; border: 1px solid {BORDER};"
+            " border-radius: 10px; }}"
+        )
+        outer.addWidget(card)
+        cl = QVBoxLayout(card)
+        cl.setContentsMargins(0, 0, 0, 0)
+        cl.setSpacing(0)
+
+        self._banner = QLabel()
+        self._banner.setFixedSize(self.CARD_W, self.BANNER_H)
+        self._banner.setScaledContents(False)
+        self._banner.setStyleSheet("border-top-left-radius: 10px; border-top-right-radius: 10px;")
+        cl.addWidget(self._banner)
+
+        body = QVBoxLayout()
+        body.setContentsMargins(14, 10, 14, 12)
+        body.setSpacing(8)
+        cl.addLayout(body)
+
+        head = QHBoxLayout()
+        head.setSpacing(10)
+        self._avatar = QLabel()
+        self._avatar.setFixedSize(self.AVATAR_SIZE, self.AVATAR_SIZE)
+        head.addWidget(self._avatar)
+
+        name_col = QVBoxLayout()
+        name_col.setSpacing(4)
+        self._name = QLabel()
+        self._name.setStyleSheet(
+            f"color: {TEXT}; font-weight: 700; font-size: 11pt; background: transparent;"
+        )
+        name_col.addWidget(self._name)
+        self._chips = QHBoxLayout()
+        self._chips.setSpacing(4)
+        self._chips.addStretch()
+        name_col.addLayout(self._chips)
+        head.addLayout(name_col, 1)
+        body.addLayout(head)
+
+        self._bio = QLabel()
+        self._bio.setWordWrap(True)
+        # Bios are arbitrary text written by other users — never let QLabel
+        # auto-interpret them as rich text (HTML injection).
+        self._bio.setTextFormat(Qt.TextFormat.PlainText)
+        self._bio.setStyleSheet(f"color: {MUTED}; font-size: 9pt; background: transparent;")
+        self._bio.hide()
+        body.addWidget(self._bio)
+
+        self.setWindowOpacity(0.98)
+
+    def set_data(self, username: str, avatar_b64: str | None, banner_b64: str | None,
+                 bio: str, roles: list[str], role_colors: dict[str, str], is_self: bool):
+        banner_px = b64_to_pixmap(banner_b64)
+        if banner_px:
+            self._banner.setPixmap(cropped_pixmap(banner_px, self.CARD_W, self.BANNER_H))
+        else:
+            color = avatar_color(username)
+            self._banner.setPixmap(QPixmap())
+            self._banner.setStyleSheet(
+                f"background-color: {color}; border-top-left-radius: 10px;"
+                " border-top-right-radius: 10px;"
+            )
+
+        avatar_px = b64_to_pixmap(avatar_b64)
+        if avatar_px:
+            self._avatar.setPixmap(circular_pixmap(avatar_px, self.AVATAR_SIZE))
+            self._avatar.setStyleSheet("background: transparent;")
+        else:
+            self._avatar.setPixmap(QPixmap())
+            self._avatar.setText(username[:1].upper())
+            self._avatar.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._avatar.setStyleSheet(
+                f"background-color: {avatar_color(username)}; color: #fff;"
+                f" border-radius: {self.AVATAR_SIZE // 2}px; font-weight: bold; font-size: 14pt;"
+            )
+
+        self._name.setText(("@" if is_self else "") + username)
+
+        while self._chips.count() > 1:  # keep the trailing stretch
+            item = self._chips.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+        for r in roles:
+            if r in role_colors:
+                self._chips.insertWidget(self._chips.count() - 1, make_role_chip(r, role_colors[r]))
+
+        if bio:
+            self._bio.setText(bio)
+            self._bio.show()
+        else:
+            self._bio.hide()
+
+        self.adjustSize()
+
+    def show_near(self, global_pos: QPoint):
+        self.adjustSize()
+        screen = QGuiApplication.screenAt(global_pos) or QGuiApplication.primaryScreen()
+        rect = screen.availableGeometry() if screen else None
+        x, y = global_pos.x(), global_pos.y()
+        if rect:
+            x = min(x, rect.right() - self.width() - 4)
+            y = min(y, rect.bottom() - self.height() - 4)
+            x = max(rect.left() + 4, x)
+            y = max(rect.top() + 4, y)
+        self.move(x, y)
+        self.show()
+
+
+class UserRow(QWidget):
+    """A single row in the user sidebar list. Emits hover events so the
+    parent window can show a ProfileCard for the hovered user."""
+
+    hovered = pyqtSignal(str, QPoint)
+    unhovered = pyqtSignal()
+
+    def __init__(self, username: str):
+        super().__init__()
+        self.username = username
+
+    def enterEvent(self, event):
+        self.hovered.emit(self.username, self.mapToGlobal(QPoint(self.width() + 6, -4)))
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self.unhovered.emit()
+        super().leaveEvent(event)
+
+
+# ---------------------------------------------------------------------------
 # Message row widget
 # ---------------------------------------------------------------------------
 
@@ -616,10 +859,27 @@ class MessageWidget(QFrame):
     header line (name · role chip · timestamp) with the message body tight
     underneath it."""
 
+    edit_requested = pyqtSignal(str)
+    delete_requested = pyqtSignal(str)
+    react_requested = pyqtSignal(str, str)   # (msg_id, emoji)
+    pin_requested = pyqtSignal(str)
+
     def __init__(self, username: str | None, timestamp: str | None,
                  is_self: bool = False, dim: bool = False,
-                 role: tuple[str, str] | None = None):
+                 role: tuple[str, str] | None = None,
+                 avatar_b64: str | None = None,
+                 msg_id: str | None = None):
         super().__init__()
+        self.msg_id = msg_id
+        self.author = username or ""
+        self.is_self = is_self
+        self.plaintext = ""       # decrypted markdown source, for editing
+        self._can_edit = False    # set by the window based on type/ownership
+        self._can_delete = False
+        self._can_pin = False
+        self._body_lbl: QLabel | None = None
+        self._react_row: QWidget | None = None
+        self._my_name = ""
         self.setObjectName("msg")
         self.setStyleSheet(
             "QFrame#msg { border: none; background: transparent; }"
@@ -633,14 +893,20 @@ class MessageWidget(QFrame):
         self._text_color = MUTED if dim else "#dbdee1"
 
         if username:
-            avatar = QLabel(username[:1].upper())
+            avatar = QLabel()
             avatar.setFixedSize(40, 40)
-            avatar.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            bg = "#3a3d45" if dim else avatar_color(username)
-            avatar.setStyleSheet(
-                f"background-color: {bg}; color: #ffffff; border-radius: 20px;"
-                " font-weight: bold; font-size: 15pt;"
-            )
+            avatar_px = None if dim else b64_to_pixmap(avatar_b64)
+            if avatar_px:
+                avatar.setPixmap(circular_pixmap(avatar_px, 40))
+                avatar.setStyleSheet("background: transparent;")
+            else:
+                avatar.setText(username[:1].upper())
+                avatar.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                bg = "#3a3d45" if dim else avatar_color(username)
+                avatar.setStyleSheet(
+                    f"background-color: {bg}; color: #ffffff; border-radius: 20px;"
+                    " font-weight: bold; font-size: 15pt;"
+                )
             outer.addWidget(avatar, 0, Qt.AlignmentFlag.AlignTop)
 
         self._lay = QVBoxLayout()
@@ -667,8 +933,16 @@ class MessageWidget(QFrame):
                 ts = QLabel(format_timestamp(timestamp))
                 ts.setStyleSheet(f"color: {MUTED}; font-size: 8pt; background: transparent;")
                 hrow.addWidget(ts, 0, Qt.AlignmentFlag.AlignVCenter)
+            self._edited_lbl = QLabel("(edited)")
+            self._edited_lbl.setStyleSheet(
+                f"color: {MUTED}; font-size: 8pt; font-style: italic; background: transparent;"
+            )
+            self._edited_lbl.hide()
+            hrow.addWidget(self._edited_lbl, 0, Qt.AlignmentFlag.AlignVCenter)
             hrow.addStretch()
             self._lay.addLayout(hrow)
+        else:
+            self._edited_lbl = None
 
     def add_text(self, text: str) -> "MessageWidget":
         lbl = QLabel()
@@ -681,7 +955,84 @@ class MessageWidget(QFrame):
         )
         lbl.setText(_insert_soft_breaks(markdown_to_html(text)))
         self._lay.addWidget(lbl)
+        if self._body_lbl is None:
+            self._body_lbl = lbl
+            self.plaintext = text
         return self
+
+    def mark_edited(self):
+        if self._edited_lbl:
+            self._edited_lbl.show()
+
+    def update_text(self, plaintext: str):
+        self.plaintext = plaintext
+        if self._body_lbl:
+            self._body_lbl.setText(_insert_soft_breaks(markdown_to_html(plaintext)))
+        self.mark_edited()
+
+    def set_mentioned(self):
+        self.setStyleSheet(
+            "QFrame#msg { border: none; border-left: 3px solid " + AMBER + ";"
+            " background-color: rgba(251, 191, 36, 18); }"
+            f"QFrame#msg:hover {{ background-color: {PANEL}; }}"
+        )
+
+    def set_reactions(self, reactions: dict, me: str):
+        self._my_name = me
+        if self._react_row is None:
+            self._react_row = QWidget()
+            self._react_row.setStyleSheet("background: transparent;")
+            h = QHBoxLayout(self._react_row)
+            h.setContentsMargins(0, 2, 0, 0)
+            h.setSpacing(4)
+            h.addStretch()
+            self._lay.addWidget(self._react_row)
+        lay = self._react_row.layout()
+        while lay.count() > 1:   # keep the trailing stretch
+            item = lay.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+        if not reactions:
+            self._react_row.hide()
+            return
+        for emoji, users in reactions.items():
+            mine = me in users
+            chip = QPushButton(f"{emoji} {len(users)}")
+            chip.setCursor(Qt.CursorShape.PointingHandCursor)
+            chip.setFixedHeight(22)
+            chip.setToolTip(", ".join(users))
+            border = ACCENT if mine else BORDER
+            bg = "#2c2a4a" if mine else ELEV
+            chip.setStyleSheet(
+                f"QPushButton {{ background-color: {bg}; color: {TEXT};"
+                f" border: 1px solid {border}; border-radius: 11px;"
+                " padding: 0px 8px; font-size: 9pt; font-weight: 400; }}"
+                f"QPushButton:hover {{ border-color: {ACCENT_H}; }}"
+            )
+            if self.msg_id:
+                chip.clicked.connect(
+                    lambda _=False, e=emoji: self.react_requested.emit(self.msg_id, e)
+                )
+            lay.insertWidget(lay.count() - 1, chip)
+        self._react_row.show()
+
+    def contextMenuEvent(self, event):
+        if not self.msg_id:
+            return
+        menu = QMenu(self)
+        react_menu = menu.addMenu("React")
+        for e in REACTION_EMOJI:
+            react_menu.addAction(
+                e, lambda em=e: self.react_requested.emit(self.msg_id, em)
+            )
+        if self._can_edit:
+            menu.addAction("Edit", lambda: self.edit_requested.emit(self.msg_id))
+        if self._can_pin:
+            menu.addAction("Pin", lambda: self.pin_requested.emit(self.msg_id))
+        if self._can_delete:
+            menu.addAction("Delete", lambda: self.delete_requested.emit(self.msg_id))
+        menu.exec(event.globalPos())
 
     def add_image(self, data: bytes, filename: str, mimetype: str) -> "MessageWidget":
         if mimetype == "image/gif":
@@ -724,23 +1075,49 @@ class ChatArea(QScrollArea):
         self._vbox.setContentsMargins(0, 8, 4, 8)
         self.setWidget(self._content)
 
+        # Tracks whether the view should stick to the bottom as new content
+        # arrives. Driven off the scrollbar itself rather than recomputed
+        # per-insert, so a burst of history messages can't race the layout
+        # and leave us reading stale geometry.
+        self._pinned = True
+        self.verticalScrollBar().valueChanged.connect(self._on_scroll)
+
+        self._notice = QPushButton("↓ New messages", self)
+        self._notice.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._notice.setStyleSheet(
+            f"QPushButton {{ background-color: {ACCENT}; color: white; "
+            "border: none; border-radius: 14px; padding: 6px 16px; "
+            "font-weight: 600; }}"
+            f"QPushButton:hover {{ background-color: {ACCENT_H}; }}"
+        )
+        self._notice.hide()
+        self._notice.clicked.connect(self._on_notice_clicked)
+
     def add_message(self, widget: QWidget):
-        at_bottom = self._at_bottom()
+        pinned = self._pinned
         self._vbox.addWidget(widget)
-        if at_bottom:
+        if pinned:
             QTimer.singleShot(0, self._to_bottom)
+        else:
+            self._show_notice()
 
     def add_system(self, text: str, color: str = SYSTEM):
-        at_bottom = self._at_bottom()
+        pinned = self._pinned
         lbl = QLabel(f"  ✦  {text}")
+        # System lines can embed server-supplied text (error messages, admin
+        # results). QLabel auto-detects rich text, so force plain text to
+        # keep HTML markup from being interpreted.
+        lbl.setTextFormat(Qt.TextFormat.PlainText)
         lbl.setStyleSheet(
             f"color: {color}; font-style: italic; padding: 2px 12px;"
             " background: transparent;"
         )
         lbl.setWordWrap(True)
         self._vbox.addWidget(lbl)
-        if at_bottom:
+        if pinned:
             QTimer.singleShot(0, self._to_bottom)
+        else:
+            self._show_notice()
 
     def clear_all(self):
         while self._vbox.count():
@@ -748,6 +1125,8 @@ class ChatArea(QScrollArea):
             w = item.widget()
             if w:
                 w.deleteLater()
+        self._notice.hide()
+        self._pinned = True
 
     def _at_bottom(self) -> bool:
         vsb = self.verticalScrollBar()
@@ -758,6 +1137,32 @@ class ChatArea(QScrollArea):
     def _to_bottom(self):
         self.verticalScrollBar().setValue(self.verticalScrollBar().maximum())
 
+    def scroll_to_bottom(self):
+        self._pinned = True
+        self._notice.hide()
+        QTimer.singleShot(0, self._to_bottom)
+
+    def _on_scroll(self, _value: int):
+        self._pinned = self._at_bottom()
+        if self._pinned:
+            self._notice.hide()
+
+    def _on_notice_clicked(self):
+        self.scroll_to_bottom()
+
+    def _show_notice(self):
+        self._notice.adjustSize()
+        x = (self.width() - self._notice.width()) // 2
+        y = self.height() - self._notice.height() - 14
+        self._notice.move(max(0, x), max(0, y))
+        self._notice.raise_()
+        self._notice.show()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self._notice.isVisible():
+            self._show_notice()
+
 
 # ---------------------------------------------------------------------------
 # Message input (multiline: Enter sends, Shift+Enter inserts a newline)
@@ -767,6 +1172,9 @@ class MessageInput(QPlainTextEdit):
     send_requested = pyqtSignal()
     history_prev = pyqtSignal()
     history_next = pyqtSignal()
+    edit_cancelled = pyqtSignal()
+    image_pasted = pyqtSignal(QImage)
+    files_pasted = pyqtSignal(list)
 
     _MAX_LINES = 6
 
@@ -792,8 +1200,24 @@ class MessageInput(QPlainTextEdit):
         cursor.movePosition(QTextCursor.MoveOperation.End)
         self.setTextCursor(cursor)
 
+    def insertFromMimeData(self, source):
+        if source.hasImage():
+            img = source.imageData()
+            if isinstance(img, QImage) and not img.isNull():
+                self.image_pasted.emit(img)
+                return
+        if source.hasUrls():
+            paths = [u.toLocalFile() for u in source.urls() if u.isLocalFile()]
+            if paths:
+                self.files_pasted.emit(paths)
+                return
+        super().insertFromMimeData(source)
+
     def keyPressEvent(self, event):
         key = event.key()
+        if key == Qt.Key.Key_Escape:
+            self.edit_cancelled.emit()
+            return
         if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
                 super().keyPressEvent(event)
@@ -911,6 +1335,224 @@ class ConnectDialog(QDialog):
 
 
 # ---------------------------------------------------------------------------
+# Options dialog: profile editor + client preferences
+# ---------------------------------------------------------------------------
+
+class OptionsDialog(QDialog):
+    def __init__(self, parent, username: str, profile: dict, connected: bool,
+                 play_sound: bool, notify_desktop: bool = True):
+        super().__init__(parent)
+        self.setWindowTitle("Options")
+        self.setFixedWidth(420)
+        self._username = username
+        self._connected = connected
+        self._avatar_b64: str | None = profile.get("avatar")
+        self._banner_b64: str | None = profile.get("banner")
+        self._notify_desktop = notify_desktop
+        self.profile_result: dict | None = None
+        self.play_sound_result: bool | None = None
+        self.notify_result: bool | None = None
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(20, 18, 20, 16)
+        lay.setSpacing(12)
+
+        tabs = QTabWidget()
+        lay.addWidget(tabs)
+        tabs.addTab(self._build_profile_tab(profile), "Profile")
+        tabs.addTab(self._build_preferences_tab(play_sound), "Preferences")
+
+        if not connected:
+            note = QLabel("Connect to a server to edit your profile.")
+            note.setStyleSheet(f"color: {AMBER}; font-size: 8pt;")
+            lay.addWidget(note)
+
+        btns = QHBoxLayout()
+        btns.addStretch()
+        close = QPushButton("Close")
+        close.setProperty("secondary", True)
+        close.setStyle(close.style())
+        close.clicked.connect(self.reject)
+        save = QPushButton("Save")
+        save.setDefault(True)
+        save.clicked.connect(self._on_save)
+        btns.addWidget(close)
+        btns.addSpacing(8)
+        btns.addWidget(save)
+        lay.addLayout(btns)
+
+    # -- Profile tab ---------------------------------------------------
+
+    def _build_profile_tab(self, profile: dict) -> QWidget:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setSpacing(10)
+
+        self._banner_lbl = QLabel()
+        self._banner_lbl.setFixedSize(ProfileCard.CARD_W, ProfileCard.BANNER_H)
+        lay.addWidget(self._banner_lbl, 0, Qt.AlignmentFlag.AlignHCenter)
+        self._render_banner()
+
+        banner_btns = QHBoxLayout()
+        pick_banner = QPushButton("Choose Background…")
+        pick_banner.clicked.connect(self._pick_banner)
+        clear_banner = QPushButton("Remove")
+        clear_banner.setProperty("secondary", True)
+        clear_banner.setStyle(clear_banner.style())
+        clear_banner.clicked.connect(self._clear_banner)
+        banner_btns.addWidget(pick_banner)
+        banner_btns.addWidget(clear_banner)
+        lay.addLayout(banner_btns)
+
+        avatar_row = QHBoxLayout()
+        self._avatar_lbl = QLabel()
+        self._avatar_lbl.setFixedSize(72, 72)
+        avatar_row.addWidget(self._avatar_lbl)
+        self._render_avatar()
+
+        avatar_btns = QVBoxLayout()
+        pick_avatar = QPushButton("Choose Picture…")
+        pick_avatar.clicked.connect(self._pick_avatar)
+        clear_avatar = QPushButton("Remove")
+        clear_avatar.setProperty("secondary", True)
+        clear_avatar.setStyle(clear_avatar.style())
+        clear_avatar.clicked.connect(self._clear_avatar)
+        avatar_btns.addWidget(pick_avatar)
+        avatar_btns.addWidget(clear_avatar)
+        avatar_row.addLayout(avatar_btns)
+        avatar_row.addStretch()
+        lay.addLayout(avatar_row)
+
+        bio_hdr = QHBoxLayout()
+        bio_hdr.addWidget(QLabel("About me"))
+        bio_hdr.addStretch()
+        self._bio_counter = QLabel()
+        self._bio_counter.setStyleSheet(f"color: {MUTED}; font-size: 8pt;")
+        bio_hdr.addWidget(self._bio_counter)
+        lay.addLayout(bio_hdr)
+
+        self._bio_edit = QPlainTextEdit(profile.get("bio", ""))
+        self._bio_edit.setFixedHeight(80)
+        self._bio_edit.setPlaceholderText("Say something about yourself…")
+        self._bio_edit.textChanged.connect(self._on_bio_changed)
+        lay.addWidget(self._bio_edit)
+        self._on_bio_changed()
+
+        return w
+
+    def _on_bio_changed(self):
+        text = self._bio_edit.toPlainText()
+        if len(text) > PROFILE_BIO_MAX_CHARS:
+            cursor = self._bio_edit.textCursor()
+            pos = cursor.position()
+            self._bio_edit.blockSignals(True)
+            self._bio_edit.setPlainText(text[:PROFILE_BIO_MAX_CHARS])
+            cursor.setPosition(min(pos, PROFILE_BIO_MAX_CHARS))
+            self._bio_edit.setTextCursor(cursor)
+            self._bio_edit.blockSignals(False)
+            text = text[:PROFILE_BIO_MAX_CHARS]
+        self._bio_counter.setText(f"{len(text)}/{PROFILE_BIO_MAX_CHARS}")
+
+    def _render_avatar(self):
+        px = b64_to_pixmap(self._avatar_b64)
+        if px:
+            self._avatar_lbl.setPixmap(circular_pixmap(px, 72))
+            self._avatar_lbl.setStyleSheet("background: transparent;")
+        else:
+            self._avatar_lbl.setPixmap(QPixmap())
+            self._avatar_lbl.setText(self._username[:1].upper())
+            self._avatar_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._avatar_lbl.setStyleSheet(
+                f"background-color: {avatar_color(self._username)}; color: #fff;"
+                " border-radius: 36px; font-weight: bold; font-size: 20pt;"
+            )
+
+    def _render_banner(self):
+        px = b64_to_pixmap(self._banner_b64)
+        if px:
+            self._banner_lbl.setPixmap(cropped_pixmap(px, ProfileCard.CARD_W, ProfileCard.BANNER_H))
+            self._banner_lbl.setStyleSheet("border-radius: 6px;")
+        else:
+            self._banner_lbl.setPixmap(QPixmap())
+            self._banner_lbl.setStyleSheet(
+                f"background-color: {avatar_color(self._username)}; border-radius: 6px;"
+            )
+
+    def _pick_avatar(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Choose Profile Picture", "",
+                                               "Images (*.png *.jpg *.jpeg *.bmp *.gif *.webp)")
+        if not path:
+            return
+        px = QPixmap(path)
+        if px.isNull():
+            QMessageBox.warning(self, "Invalid Image", "Could not load that image.")
+            return
+        square = cropped_pixmap(px, PROFILE_AVATAR_PX, PROFILE_AVATAR_PX)
+        b64 = pixmap_to_b64(square)
+        if len(b64) > PROFILE_IMAGE_MAX_B64:
+            QMessageBox.warning(self, "Image Too Large", "That image is too large even after resizing.")
+            return
+        self._avatar_b64 = b64
+        self._render_avatar()
+
+    def _clear_avatar(self):
+        self._avatar_b64 = None
+        self._render_avatar()
+
+    def _pick_banner(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Choose Background Image", "",
+                                               "Images (*.png *.jpg *.jpeg *.bmp *.gif *.webp)")
+        if not path:
+            return
+        px = QPixmap(path)
+        if px.isNull():
+            QMessageBox.warning(self, "Invalid Image", "Could not load that image.")
+            return
+        cropped = cropped_pixmap(px, PROFILE_BANNER_W, PROFILE_BANNER_H)
+        b64 = pixmap_to_b64(cropped)
+        if len(b64) > PROFILE_IMAGE_MAX_B64:
+            QMessageBox.warning(self, "Image Too Large", "That image is too large even after resizing.")
+            return
+        self._banner_b64 = b64
+        self._render_banner()
+
+    def _clear_banner(self):
+        self._banner_b64 = None
+        self._render_banner()
+
+    # -- Preferences tab -------------------------------------------------
+
+    def _build_preferences_tab(self, play_sound: bool) -> QWidget:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setSpacing(10)
+        lay.setAlignment(Qt.AlignmentFlag.AlignTop)
+
+        self._sound_check = QCheckBox("Play a sound when a new message arrives")
+        self._sound_check.setChecked(play_sound)
+        lay.addWidget(self._sound_check)
+
+        self._notify_check = QCheckBox("Show desktop notifications when the window is inactive")
+        self._notify_check.setChecked(self._notify_desktop)
+        lay.addWidget(self._notify_check)
+
+        return w
+
+    # -- Save ------------------------------------------------------------
+
+    def _on_save(self):
+        self.play_sound_result = self._sound_check.isChecked()
+        self.notify_result = self._notify_check.isChecked()
+        if self._connected:
+            self.profile_result = {
+                "bio": self._bio_edit.toPlainText().strip(),
+                "avatar": self._avatar_b64,
+                "banner": self._banner_b64,
+            }
+        self.accept()
+
+
+# ---------------------------------------------------------------------------
 # WebSocket worker (background QThread)
 # ---------------------------------------------------------------------------
 
@@ -979,6 +1621,7 @@ class ChatWindow(QMainWindow):
         self.worker: WebSocketWorker | None = None
         self.thread: QThread | None = None
         self.fernet: Fernet | None = None
+        self._secret = ""
         self.username = ""
         self.connect_params: dict = {}
         self.current_room: str | None = None
@@ -993,7 +1636,51 @@ class ChatWindow(QMainWindow):
         self._history: list[str] = []
         self._history_idx = -1
 
+        # Profile cards
+        self.profile_cache: dict[str, dict] = {}   # username -> {bio, avatar, banner, roles, is_admin}
+        self.my_profile: dict = {"bio": "", "avatar": None, "banner": None}
+        self.profile_card = ProfileCard()
+        self._hover_user: str | None = None
+        self._hover_pos: QPoint | None = None
+        self._hover_timer = QTimer(self)
+        self._hover_timer.setSingleShot(True)
+        self._hover_timer.timeout.connect(self._show_profile_popup)
+
+        # Local client preferences (persisted outside the server config)
+        self.settings = QSettings("Bastion", "Client")
+        self.play_sound_on_message = self.settings.value("play_sound_on_message", False, type=bool)
+        self.notify_desktop = self.settings.value("notify_desktop", True, type=bool)
+
+        # Message actions / ambient state
+        self._msg_widgets: dict[str, MessageWidget] = {}   # msg id -> widget (current room)
+        self._editing_id: str | None = None
+        self.unread: dict[str, int] = {}                   # room -> unread count
+        self._typers: dict[str, float] = {}                # username -> expiry time
+        self._typing_prune = QTimer(self)
+        self._typing_prune.timeout.connect(self._update_typing_label)
+        self._typing_prune.start(1000)
+        self._last_typing_sent = 0.0
+
+        # Auto-reconnect
+        self._manual_disconnect = False
+        self._authed = False
+        self._reconnect_attempts = 0
+        self._rejoin_room: str | None = None
+        self._reconnect_timer = QTimer(self)
+        self._reconnect_timer.setSingleShot(True)
+        self._reconnect_timer.timeout.connect(self._try_reconnect)
+
+        self.setAcceptDrops(True)
+
         self._build_ui()
+
+        # Desktop notifications via the system tray (needs a visible icon)
+        icon = self._make_app_icon()
+        self.setWindowIcon(icon)
+        self.tray = QSystemTrayIcon(icon, self)
+        self.tray.setToolTip("Bastion")
+        if self.notify_desktop:
+            self.tray.show()
         QTimer.singleShot(120, self._show_connect_dialog)
 
     # -----------------------------------------------------------------------
@@ -1034,6 +1721,7 @@ class ChatWindow(QMainWindow):
         tb.addSpacing(20)
 
         for text, slot, secondary in [
+            ("⚙ Options",  self._show_options_dialog, True),
             ("Disconnect", self._disconnect, True),
             ("Connect",    self._show_connect_dialog, False),
         ]:
@@ -1085,9 +1773,22 @@ class ChatWindow(QMainWindow):
         cp_lay.setContentsMargins(0, 0, 0, 0)
         cp_lay.setSpacing(0)
 
+        header = QWidget()
+        hl = QHBoxLayout(header)
+        hl.setContentsMargins(0, 0, 10, 0)
+        hl.setSpacing(0)
         self.room_title = QLabel("Select a room")
         self.room_title.setStyleSheet("font-size:12pt; font-weight:bold; padding:10px 16px;")
-        cp_lay.addWidget(self.room_title)
+        hl.addWidget(self.room_title)
+        hl.addStretch()
+        self.pins_btn = QPushButton("📌")
+        self.pins_btn.setFixedSize(32, 32)
+        self.pins_btn.setToolTip("Pinned messages")
+        self.pins_btn.setProperty("secondary", True)
+        self.pins_btn.setStyle(self.pins_btn.style())
+        self.pins_btn.clicked.connect(self._request_pins)
+        hl.addWidget(self.pins_btn)
+        cp_lay.addWidget(header)
 
         sep = QFrame()
         sep.setFrameShape(QFrame.Shape.HLine)
@@ -1097,6 +1798,20 @@ class ChatWindow(QMainWindow):
 
         self.chat_area = ChatArea()
         cp_lay.addWidget(self.chat_area, 1)
+
+        self.edit_banner = QLabel("  ✏️  Editing message — press Esc to cancel")
+        self.edit_banner.setStyleSheet(
+            f"background: {ELEV}; color: {AMBER}; font-size: 8pt; padding: 3px 10px;"
+        )
+        self.edit_banner.hide()
+        cp_lay.addWidget(self.edit_banner)
+
+        self.typing_label = QLabel("")
+        self.typing_label.setFixedHeight(18)
+        self.typing_label.setStyleSheet(
+            f"color: {MUTED}; font-size: 8pt; font-style: italic; padding: 0px 16px;"
+        )
+        cp_lay.addWidget(self.typing_label)
 
         # ── Input bar ─────────────────────────────────────────────────────
         ibar = QWidget()
@@ -1122,6 +1837,10 @@ class ChatWindow(QMainWindow):
         self.msg_entry.send_requested.connect(self._send_message)
         self.msg_entry.history_prev.connect(self._history_up)
         self.msg_entry.history_next.connect(self._history_down)
+        self.msg_entry.edit_cancelled.connect(self._cancel_edit)
+        self.msg_entry.image_pasted.connect(self._send_pasted_image)
+        self.msg_entry.files_pasted.connect(self._send_dropped_files)
+        self.msg_entry.textChanged.connect(self._maybe_send_typing)
         ir.addWidget(self.msg_entry)
 
         send = QPushButton("Send")
@@ -1148,16 +1867,56 @@ class ChatWindow(QMainWindow):
         if dlg.exec() == QDialog.DialogCode.Accepted and dlg.result_data:
             self._connect(dlg.result_data)
 
-    def _connect(self, params: dict):
+    def _show_options_dialog(self):
+        connected = bool(self.worker) and bool(self.username)
+        dlg = OptionsDialog(
+            self, self.username or "you", self.my_profile,
+            connected=connected, play_sound=self.play_sound_on_message,
+            notify_desktop=self.notify_desktop,
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        if dlg.play_sound_result is not None:
+            self.play_sound_on_message = dlg.play_sound_result
+            self.settings.setValue("play_sound_on_message", self.play_sound_on_message)
+        if dlg.notify_result is not None:
+            self.notify_desktop = dlg.notify_result
+            self.settings.setValue("notify_desktop", self.notify_desktop)
+            self.tray.setVisible(self.notify_desktop)
+        if dlg.profile_result is not None and self.worker:
+            self.worker.send_msg({"type": "update_profile", **dlg.profile_result})
+
+    def _cleanup_connection(self):
+        """Tear down the worker thread and key material without touching UI state."""
         if self.worker:
-            self._disconnect(silent=True)
+            self.worker.close()
+        if self.thread:
+            self.thread.quit()
+            self.thread.wait(2000)
+        self.worker = None
+        self.thread = None
+        self.fernet = None
+        self._secret = ""
+
+    def _try_reconnect(self):
+        if self._manual_disconnect or self.worker or not self.connect_params:
+            return
+        self._set_status("Reconnecting…", AMBER)
+        self._connect(self.connect_params)
+
+    def _connect(self, params: dict):
+        self._reconnect_timer.stop()
+        self._cleanup_connection()
+        self._manual_disconnect = False
         self.connect_params = params
         self.username = params["username"]
         # Message key: prefer the dedicated passphrase (never sent to the
         # server) and fall back to the server password for compatibility.
+        # The Fernet itself is built on auth_result, once the server has
+        # told us its per-server KDF salt.
         self._custom_key = bool(params.get("enc_passphrase"))
-        secret = params.get("enc_passphrase") or params["server_password"]
-        self.fernet = Fernet(derive_key(secret))
+        self._secret = params.get("enc_passphrase") or params["server_password"]
+        self.fernet = None
 
         self._set_status(f"Connecting to {params['host']}:{params['port']}…", AMBER)
 
@@ -1169,15 +1928,13 @@ class ChatWindow(QMainWindow):
         self.thread.start()
 
     def _disconnect(self, silent: bool = False):
+        self._manual_disconnect = True
+        self._authed = False
+        self._reconnect_timer.stop()
+        self._reconnect_attempts = 0
+        self._rejoin_room = None
         was_connected = self.worker is not None
-        if self.worker:
-            self.worker.close()
-        if self.thread:
-            self.thread.quit()
-            self.thread.wait(2000)
-        self.worker = None
-        self.thread = None
-        self.fernet = None
+        self._cleanup_connection()
         self._reset_ui()
         if was_connected and not silent:
             self.chat_area.add_system("Disconnected.")
@@ -1192,6 +1949,16 @@ class ChatWindow(QMainWindow):
         self._set_status("Not connected", MUTED)
         self.lock_label.hide()
         self._apply_max_file(_DEFAULT_MAX_FILE_BYTES / 1_048_576)
+        self.profile_cache = {}
+        self.my_profile = {"bio": "", "avatar": None, "banner": None}
+        self._hover_timer.stop()
+        self._hover_user = None
+        self.profile_card.hide()
+        self._msg_widgets.clear()
+        self.unread.clear()
+        self._typers.clear()
+        self.typing_label.setText("")
+        self._cancel_edit()
 
     # -----------------------------------------------------------------------
     # Incoming message dispatch
@@ -1202,6 +1969,17 @@ class ChatWindow(QMainWindow):
 
         if t == "auth_result":
             if msg["success"]:
+                # Derive the message key now that we know the server's KDF
+                # salt (older servers don't send one: use the legacy salt).
+                salt = _LEGACY_KDF_SALT
+                salt_hex = msg.get("kdf_salt")
+                if salt_hex:
+                    try:
+                        salt = bytes.fromhex(salt_hex)
+                    except ValueError:
+                        pass
+                self.fernet = Fernet(derive_key(self._secret, salt))
+                self._secret = ""
                 self._set_status(f"Connected as {self.username}", GREEN)
                 if self._custom_key:
                     self.lock_label.setText("🔒 Encrypted (separate passphrase)")
@@ -1212,13 +1990,23 @@ class ChatWindow(QMainWindow):
                 self.role_colors = msg.get("roles", {})
                 self.my_roles = msg.get("your_roles", [])
                 self.is_admin = msg.get("is_admin", False)
+                self._authed = True
+                self._reconnect_attempts = 0
                 self._refresh_rooms()
                 self._apply_max_file(msg.get("max_file_mb", _DEFAULT_MAX_FILE_BYTES / 1_048_576))
                 self.chat_area.add_system("Connected — messages are encrypted before they leave this device.")
                 if self.my_roles:
                     self.chat_area.add_system("Your roles: " + ", ".join(self.my_roles))
+                self.worker.send_msg({"type": "get_profile", "username": self.username})
+                # After an auto-reconnect, hop back into the room we were in
+                if self._rejoin_room and self._rejoin_room in self.rooms:
+                    self.room_list.setCurrentRow(self.rooms.index(self._rejoin_room))
+                self._rejoin_room = None
             else:
                 self._set_status("Not connected", RED)
+                # Don't loop retries against a failing login (changed password, kick)
+                self._manual_disconnect = True
+                self._authed = False
                 QMessageBox.critical(self, "Auth Failed", msg.get("message", "Unknown error"))
 
         elif t == "rooms_list":
@@ -1236,6 +2024,7 @@ class ChatWindow(QMainWindow):
             self.user_roles.update(msg.get("user_roles", {}))
             if msg["room"] == self.current_room:
                 self._refresh_users()
+                self._prefetch_profiles(msg["users"])
 
         elif t == "roles_update":
             if "roles" in msg:
@@ -1250,6 +2039,8 @@ class ChatWindow(QMainWindow):
             if room == self.current_room:
                 self.current_room = None
                 self.chat_area.clear_all()
+                self._msg_widgets.clear()
+                self._cancel_edit()
                 self.room_title.setText("Select a room")
 
         elif t == "room_message":
@@ -1268,6 +2059,7 @@ class ChatWindow(QMainWindow):
             if room == self.current_room:
                 self._refresh_users()
                 self.chat_area.add_system(f"{user} joined the room")
+                self._prefetch_profiles([user])
 
         elif t == "user_left":
             room, user = msg["room"], msg["username"]
@@ -1303,13 +2095,81 @@ class ChatWindow(QMainWindow):
             if msg.get("room") == self.current_room:
                 self.chat_area.add_system("─── End of history ───")
 
+        elif t == "profile":
+            username = msg.get("username")
+            if not username:
+                return
+            data = {
+                "bio": msg.get("bio", ""), "avatar": msg.get("avatar"),
+                "banner": msg.get("banner"), "roles": msg.get("roles", []),
+                "is_admin": msg.get("is_admin", False), "_ts": time.time(),
+            }
+            self.profile_cache[username] = data
+            if username == self.username:
+                self.my_profile = {"bio": data["bio"], "avatar": data["avatar"], "banner": data["banner"]}
+            if self._hover_user == username and self.profile_card.isVisible():
+                self._render_profile_popup(username, data)
+            if username in self.room_users.get(self.current_room, []):
+                self._refresh_users()
+
+        elif t == "profile_update_result":
+            color = SYSTEM if msg.get("success") else RED
+            self.chat_area.add_system(msg.get("message", ""), color=color)
+
+        elif t == "message_edited":
+            w = self._msg_widgets.get(msg.get("id", ""))
+            if w and self.fernet:
+                try:
+                    new = unpad_plaintext(self.fernet.decrypt(msg["content"].encode())).decode()
+                except Exception:
+                    new = "[unable to decrypt]"
+                w.update_text(new)
+
+        elif t == "message_deleted":
+            w = self._msg_widgets.pop(msg.get("id", ""), None)
+            if w:
+                w.setParent(None)
+                w.deleteLater()
+
+        elif t == "reaction_update":
+            w = self._msg_widgets.get(msg.get("id", ""))
+            if w:
+                w.set_reactions(msg.get("reactions", {}), self.username)
+
+        elif t == "typing":
+            if msg.get("room") == self.current_room and msg.get("username") != self.username:
+                self._typers[msg["username"]] = time.time() + 4
+                self._update_typing_label()
+
+        elif t == "room_activity":
+            room = msg.get("room")
+            if room and room != self.current_room:
+                self.unread[room] = self.unread.get(room, 0) + 1
+                self._update_room_badges()
+
+        elif t == "pins_list":
+            self._show_pins_dialog(msg.get("room", ""), msg.get("pins", []))
+
         elif t == "_connect_error":
             self._set_status("Connection failed", RED)
             QMessageBox.critical(self, "Connection Error", msg.get("message", ""))
 
         elif t == "_connection_lost":
-            self.chat_area.add_system("Disconnected from server.")
-            self._reset_ui()
+            if self._manual_disconnect or not self._authed or not self.connect_params:
+                self.chat_area.add_system("Disconnected from server.")
+                self._reset_ui()
+            else:
+                # Unexpected drop after a successful session: retry with backoff
+                self._rejoin_room = self.current_room or self._rejoin_room
+                self._cleanup_connection()
+                self._reset_ui()
+                delay = min(30, 2 ** min(self._reconnect_attempts, 5))
+                self._reconnect_attempts += 1
+                self.chat_area.add_system(
+                    f"Connection lost — reconnecting in {delay}s…", color=AMBER
+                )
+                self._set_status(f"Reconnecting in {delay}s…", AMBER)
+                self._reconnect_timer.start(delay * 1000)
 
     def _primary_role(self, username: str) -> tuple[str, str] | None:
         """The first role a user holds, as (name, color), for a header chip."""
@@ -1322,14 +2182,48 @@ class ChatWindow(QMainWindow):
         if msg.get("room") != self.current_room:
             return
         try:
-            content = self.fernet.decrypt(msg["content"].encode()).decode()
+            content = unpad_plaintext(self.fernet.decrypt(msg["content"].encode())).decode()
         except Exception:
             content = "[unable to decrypt]"
         is_self = msg["username"] == self.username
+        mid = msg.get("id")
         mw = MessageWidget(msg["username"], msg["timestamp"], is_self, dim=historical,
-                           role=self._primary_role(msg["username"]))
+                           role=self._primary_role(msg["username"]),
+                           avatar_b64=self._avatar_for(msg["username"]),
+                           msg_id=mid)
         mw.add_text(content)
+        mw._can_edit = is_self and bool(mid)
+        mw._can_delete = bool(mid) and (is_self or self.is_admin)
+        mw._can_pin = bool(mid) and self.is_admin
+        self._wire_message_widget(mw)
+        if msg.get("edited"):
+            mw.mark_edited()
+        if msg.get("reactions"):
+            mw.set_reactions(msg["reactions"], self.username)
+        mentioned = (not is_self and self.username
+                     and re.search(rf"@{re.escape(self.username)}\b", content, re.IGNORECASE))
+        if mentioned:
+            mw.set_mentioned()
         self.chat_area.add_message(mw)
+        if mid:
+            self._msg_widgets[mid] = mw
+        self._typers.pop(msg["username"], None)
+        self._update_typing_label()
+        if not historical and not is_self:
+            self._notify_message(msg["username"], msg.get("room", ""), mention=bool(mentioned))
+
+    def _avatar_for(self, username: str) -> str | None:
+        cached = self.profile_cache.get(username)
+        return cached.get("avatar") if cached else None
+
+    def _prefetch_profiles(self, usernames: list[str]):
+        """Warm the profile cache for users we don't know about yet, so
+        their avatar shows up on messages without needing a hover first."""
+        if not self.worker:
+            return
+        for u in usernames:
+            if u not in self.profile_cache:
+                self.worker.send_msg({"type": "get_profile", "username": u})
 
     def _recv_file(self, msg: dict):
         if msg.get("room") != self.current_room:
@@ -1337,19 +2231,23 @@ class ChatWindow(QMainWindow):
         is_self = msg["username"] == self.username
         historical = msg.get("historical", False)
         role = self._primary_role(msg["username"])
+        avatar_b64 = self._avatar_for(msg["username"])
         try:
-            payload = json.loads(self.fernet.decrypt(msg["content"].encode()).decode())
+            payload = json.loads(unpad_plaintext(self.fernet.decrypt(msg["content"].encode())).decode())
             filename = payload["filename"]
             mimetype = payload.get("mimetype", "application/octet-stream")
             raw      = base64.b64decode(payload["data"])
             caption  = payload.get("caption", "")
         except Exception:
-            mw = MessageWidget(msg["username"], msg["timestamp"], is_self, dim=historical, role=role)
+            mw = MessageWidget(msg["username"], msg["timestamp"], is_self, dim=historical,
+                                role=role, avatar_b64=avatar_b64)
             mw.add_text("[could not decrypt file]")
             self.chat_area.add_message(mw)
             return
 
-        mw = MessageWidget(msg["username"], msg["timestamp"], is_self, dim=historical, role=role)
+        mid = msg.get("id")
+        mw = MessageWidget(msg["username"], msg["timestamp"], is_self, dim=historical,
+                           role=role, avatar_b64=avatar_b64, msg_id=mid)
         if caption:
             mw.add_text(caption)
         if mimetype in IMAGE_MIME:
@@ -1358,7 +2256,230 @@ class ChatWindow(QMainWindow):
             mw.add_text_preview(raw, filename)
         else:
             mw.add_file(raw, filename, mimetype)
+        mw._can_delete = bool(mid) and (is_self or self.is_admin)
+        self._wire_message_widget(mw)
+        if msg.get("reactions"):
+            mw.set_reactions(msg["reactions"], self.username)
         self.chat_area.add_message(mw)
+        if mid:
+            self._msg_widgets[mid] = mw
+        if not historical and not is_self:
+            self._notify_message(msg["username"], msg.get("room", ""))
+
+    def _wire_message_widget(self, mw: MessageWidget):
+        mw.edit_requested.connect(self._start_edit)
+        mw.delete_requested.connect(self._delete_message)
+        mw.react_requested.connect(self._send_react)
+        mw.pin_requested.connect(self._pin_message)
+
+    # -----------------------------------------------------------------------
+    # Message actions (edit / delete / react / pin)
+    # -----------------------------------------------------------------------
+
+    def _start_edit(self, mid: str):
+        w = self._msg_widgets.get(mid)
+        if not w or not self.worker:
+            return
+        self._editing_id = mid
+        self.msg_entry.setText(w.plaintext)
+        self.edit_banner.show()
+        self.msg_entry.setFocus()
+
+    def _cancel_edit(self):
+        if self._editing_id:
+            self._editing_id = None
+            self.msg_entry.clear()
+        self.edit_banner.hide()
+
+    def _delete_message(self, mid: str):
+        if not (self.worker and self.current_room):
+            return
+        answer = QMessageBox.question(
+            self, "Delete Message", "Delete this message for everyone?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            self.worker.send_msg({"type": "delete_message",
+                                  "room": self.current_room, "id": mid})
+
+    def _send_react(self, mid: str, emoji: str):
+        if self.worker and self.current_room:
+            self.worker.send_msg({"type": "react", "room": self.current_room,
+                                  "id": mid, "emoji": emoji})
+
+    def _pin_message(self, mid: str):
+        if self.worker and self.current_room:
+            self.worker.send_msg({"type": "pin_message",
+                                  "room": self.current_room, "id": mid})
+
+    def _request_pins(self):
+        if self.worker and self.current_room:
+            self.worker.send_msg({"type": "get_pins", "room": self.current_room})
+
+    def _show_pins_dialog(self, room: str, pins: list):
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Pinned — #{room}")
+        dlg.setMinimumWidth(420)
+        lay = QVBoxLayout(dlg)
+        lay.setSpacing(8)
+        if not pins:
+            lay.addWidget(QLabel("No pinned messages in this room."))
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        inner = QWidget()
+        ilay = QVBoxLayout(inner)
+        ilay.setSpacing(6)
+        for pin in pins[:50]:
+            try:
+                text = unpad_plaintext(self.fernet.decrypt(pin["content"].encode())).decode()
+            except Exception:
+                text = "[unable to decrypt]"
+            row = QFrame()
+            row.setStyleSheet(f"background: {ELEV}; border-radius: 6px;")
+            rl = QVBoxLayout(row)
+            rl.setContentsMargins(10, 6, 10, 8)
+            head = QHBoxLayout()
+            author = QLabel(pin.get("username", "?"))
+            author.setStyleSheet("font-weight: bold; background: transparent;")
+            head.addWidget(author)
+            ts = QLabel(format_timestamp(pin.get("timestamp")))
+            ts.setStyleSheet(f"color: {MUTED}; font-size: 8pt; background: transparent;")
+            head.addWidget(ts)
+            head.addStretch()
+            if self.is_admin:
+                unpin = QPushButton("Unpin")
+                unpin.setProperty("secondary", True)
+                unpin.setStyle(unpin.style())
+                unpin.setFixedHeight(24)
+                unpin.clicked.connect(
+                    lambda _=False, m=pin.get("id"), d=dlg: (self._unpin_message(m), d.accept())
+                )
+                head.addWidget(unpin)
+            rl.addLayout(head)
+            body = QLabel(text)
+            body.setWordWrap(True)
+            body.setTextFormat(Qt.TextFormat.PlainText)
+            body.setStyleSheet("background: transparent;")
+            rl.addWidget(body)
+            ilay.addWidget(row)
+        ilay.addStretch()
+        scroll.setWidget(inner)
+        lay.addWidget(scroll, 1)
+        close = QPushButton("Close")
+        close.clicked.connect(dlg.accept)
+        lay.addWidget(close, 0, Qt.AlignmentFlag.AlignRight)
+        dlg.resize(460, 380)
+        dlg.exec()
+
+    def _unpin_message(self, mid: str):
+        if self.worker and self.current_room and mid:
+            self.worker.send_msg({"type": "unpin_message",
+                                  "room": self.current_room, "id": mid})
+
+    # -----------------------------------------------------------------------
+    # Typing indicator / unread badges / notifications
+    # -----------------------------------------------------------------------
+
+    def _maybe_send_typing(self):
+        if not (self.worker and self.current_room):
+            return
+        if not self.msg_entry.text().strip():
+            return
+        now = time.time()
+        if now - self._last_typing_sent > 2.5:
+            self._last_typing_sent = now
+            self.worker.send_msg({"type": "typing", "room": self.current_room})
+
+    def _update_typing_label(self):
+        now = time.time()
+        self._typers = {u: exp for u, exp in self._typers.items() if exp > now}
+        names = sorted(self._typers)
+        if not names:
+            text = ""
+        elif len(names) == 1:
+            text = f"{names[0]} is typing…"
+        elif len(names) == 2:
+            text = f"{names[0]} and {names[1]} are typing…"
+        else:
+            text = "Several people are typing…"
+        self.typing_label.setText(text)
+
+    def _update_room_badges(self):
+        for i, room in enumerate(self.rooms):
+            item = self.room_list.item(i)
+            if item is None:
+                continue
+            n = self.unread.get(room, 0)
+            item.setText(f"#  {room}" + (f"   ● {n}" if n else ""))
+
+    def _notify_message(self, sender: str, room: str, mention: bool = False):
+        if mention or self.play_sound_on_message:
+            QApplication.beep()
+        if self.notify_desktop and not self.isActiveWindow() and self.tray.isVisible():
+            # Content-free on purpose: message text never leaves the chat view
+            body = (f"{sender} mentioned you in #{room}" if mention
+                    else f"New message from {sender} in #{room}")
+            self.tray.showMessage("Bastion", body,
+                                  QSystemTrayIcon.MessageIcon.Information, 4000)
+
+    def _make_app_icon(self) -> QIcon:
+        px = QPixmap(64, 64)
+        px.fill(Qt.GlobalColor.transparent)
+        p = QPainter(px)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setBrush(QColor(ACCENT))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawEllipse(0, 0, 64, 64)
+        p.setPen(QColor("#ffffff"))
+        p.setFont(QFont("Segoe UI", 28, QFont.Weight.Bold))
+        p.drawText(px.rect(), Qt.AlignmentFlag.AlignCenter, "B")
+        p.end()
+        return QIcon(px)
+
+    # -----------------------------------------------------------------------
+    # Paste / drag-and-drop attachments
+    # -----------------------------------------------------------------------
+
+    def dragEnterEvent(self, event):
+        if (event.mimeData().hasUrls() and self.worker
+                and self.fernet and self.current_room):
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        paths = [u.toLocalFile() for u in event.mimeData().urls() if u.isLocalFile()]
+        self._send_dropped_files(paths)
+
+    def _send_dropped_files(self, paths: list):
+        if not (self.worker and self.fernet and self.current_room):
+            QMessageBox.information(self, "Not Connected", "Join a room before sending files.")
+            return
+        for path in paths[:5]:
+            if os.path.isfile(path):
+                self._send_file_path(path)
+
+    def _send_pasted_image(self, image: QImage):
+        if not (self.worker and self.fernet and self.current_room):
+            QMessageBox.information(self, "Not Connected", "Join a room before sending images.")
+            return
+        buf = QBuffer()
+        buf.open(QBuffer.OpenModeFlag.WriteOnly)
+        image.save(buf, "PNG")
+        raw = bytes(buf.data())
+        if len(raw) > self.max_file_bytes:
+            QMessageBox.warning(self, "Image Too Large",
+                                f"Pasted image is {len(raw) / 1_048_576:.1f} MB — over the server limit.")
+            return
+        answer = QMessageBox.question(
+            self, "Paste Image", f"Send pasted image ({max(1, len(raw) // 1024)} KB)?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        fname = datetime.datetime.now().strftime("pasted_%H%M%S.png")
+        caption = self.msg_entry.text().strip()
+        self.msg_entry.clear()
+        self._send_file_bytes(raw, fname, "image/png", caption)
 
     # -----------------------------------------------------------------------
     # UI helpers
@@ -1369,6 +2490,7 @@ class ChatWindow(QMainWindow):
         self.room_list.clear()
         for room in self.rooms:
             self.room_list.addItem(f"#  {room}")
+        self._update_room_badges()
         if self.current_room in self.rooms:
             self.room_list.setCurrentRow(self.rooms.index(self.current_room))
         self.room_list.blockSignals(False)
@@ -1383,19 +2505,35 @@ class ChatWindow(QMainWindow):
             # width instead of trusting row.sizeHint(), which can under-report
             # before the widget has been laid out (causing chips to clip).
             item.setSizeHint(QSize(0, 36))
-            if roles:
-                item.setToolTip("Roles: " + ", ".join(roles))
             self.user_list.addItem(item)
             self.user_list.setItemWidget(item, row)
 
     def _make_user_row(self, user: str, roles: list[str]) -> QWidget:
-        row = QWidget()
+        row = UserRow(user)
         row.setStyleSheet("background: transparent;")
+        row.hovered.connect(self._on_user_row_hover)
+        row.unhovered.connect(self._on_user_row_unhover)
         lay = QHBoxLayout(row)
-        lay.setContentsMargins(10, 0, 10, 0)
+        lay.setContentsMargins(8, 0, 10, 0)
         lay.setSpacing(6)
         vc = Qt.AlignmentFlag.AlignVCenter
         is_self = user == self.username
+
+        avatar_lbl = QLabel()
+        avatar_lbl.setFixedSize(22, 22)
+        cached = self.profile_cache.get(user)
+        avatar_px = b64_to_pixmap(cached["avatar"]) if cached else None
+        if avatar_px:
+            avatar_lbl.setPixmap(circular_pixmap(avatar_px, 22))
+        else:
+            avatar_lbl.setText(user[:1].upper())
+            avatar_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            avatar_lbl.setStyleSheet(
+                f"background-color: {avatar_color(user)}; color: #fff; border-radius: 11px;"
+                " font-weight: bold; font-size: 8pt;"
+            )
+        lay.addWidget(avatar_lbl, 0, vc)
+
         name = QLabel(("@" if is_self else "") + user)
         name.setStyleSheet(
             f"color: {SELF_NAME if is_self else TEXT}; background: transparent;"
@@ -1403,10 +2541,45 @@ class ChatWindow(QMainWindow):
         )
         lay.addWidget(name, 0, vc)
         lay.addStretch()
-        # Show up to two role chips to keep the row compact; tooltip lists all
+        # Show up to two role chips to keep the row compact
         for r in roles[:2]:
             lay.addWidget(make_role_chip(r, self.role_colors[r]), 0, vc)
         return row
+
+    # -----------------------------------------------------------------------
+    # Profile hover card
+    # -----------------------------------------------------------------------
+
+    def _on_user_row_hover(self, username: str, global_pos: QPoint):
+        self._hover_user = username
+        self._hover_pos = global_pos
+        self._hover_timer.start(350)
+
+    def _on_user_row_unhover(self):
+        self._hover_timer.stop()
+        self._hover_user = None
+        self.profile_card.hide()
+
+    def _show_profile_popup(self):
+        username = self._hover_user
+        if not username or not self._hover_pos:
+            return
+        cached = self.profile_cache.get(username)
+        self._render_profile_popup(username, cached)
+        if self.worker and (not cached or time.time() - cached.get("_ts", 0) > 20):
+            self.worker.send_msg({"type": "get_profile", "username": username})
+
+    def _render_profile_popup(self, username: str, data: dict | None):
+        roles = [r for r in self.user_roles.get(username, []) if r in self.role_colors]
+        bio = (data or {}).get("bio", "")
+        avatar_b64 = (data or {}).get("avatar")
+        banner_b64 = (data or {}).get("banner")
+        self.profile_card.set_data(
+            username, avatar_b64, banner_b64, bio, roles, self.role_colors,
+            is_self=(username == self.username),
+        )
+        if self._hover_pos:
+            self.profile_card.show_near(self._hover_pos)
 
     def _on_room_changed(self, row: int):
         if row < 0 or not self.worker or row >= len(self.rooms):
@@ -1419,6 +2592,12 @@ class ChatWindow(QMainWindow):
         self.current_room = room
         self.room_title.setText(f"#  {room}")
         self.chat_area.clear_all()
+        self._msg_widgets.clear()
+        self._typers.clear()
+        self._update_typing_label()
+        self._cancel_edit()
+        self.unread.pop(room, None)
+        self._update_room_badges()
         self.worker.send_msg({"type": "join_room", "room": room})
 
     # -----------------------------------------------------------------------
@@ -1427,6 +2606,14 @@ class ChatWindow(QMainWindow):
 
     def _send_message(self):
         content = self.msg_entry.text().strip()
+        if self._editing_id:
+            mid = self._editing_id
+            if content and self.worker and self.fernet and self.current_room:
+                enc = self.fernet.encrypt(pad_plaintext(content.encode())).decode()
+                self.worker.send_msg({"type": "edit_message", "room": self.current_room,
+                                      "id": mid, "content": enc})
+            self._cancel_edit()
+            return
         if not content:
             return
         if content.startswith("/") and "\n" not in content:
@@ -1438,7 +2625,7 @@ class ChatWindow(QMainWindow):
         self._history.insert(0, content)
         self._history_idx = -1
         self.msg_entry.clear()
-        enc = self.fernet.encrypt(content.encode()).decode()
+        enc = self.fernet.encrypt(pad_plaintext(content.encode())).decode()
         self.worker.send_msg({"type": "send_message", "room": self.current_room, "content": enc})
 
     def _handle_slash_command(self, text: str):
@@ -1449,36 +2636,7 @@ class ChatWindow(QMainWindow):
         args = parts[1:]
 
         if command == "help":
-            lines = [
-                "Available slash commands:",
-                "  /online                           List connected users",
-                "  /listusers                        List all registered users",
-                "  /listrooms                        List all rooms",
-                "  /kick <username>                  Kick a user  [admin]",
-                "  /adduser <username> <pass>        Add a new user  [admin]",
-                "  /removeuser <username>            Remove a user  [admin]",
-                "  /addroom <name>                   Create a room  [admin]",
-                "  /removeroom <name>                Remove a room  [admin]",
-                "  /setpassword <new_password>       Change server password  [admin]",
-                "  /setmaxfile <MB>                  Set max file upload size  [admin]",
-                "  /history on|off                   Enable/disable chat history  [admin]",
-                "  /makeadmin <username>             Grant admin privileges  [admin]",
-                "  /removeadmin <username>           Revoke admin privileges  [admin]",
-                "  /role add <name> [#color]         Create a role  [admin]",
-                "  /role del <name>                  Delete a role  [admin]",
-                "  /role rooms <name> [room ...]     Set rooms a role grants  [admin]",
-                "  /role list                        List roles and members  [admin]",
-                "  /grantrole <username> <role>      Give a user a role  [admin]",
-                "  /revokerole <username> <role>     Remove a role from a user  [admin]",
-                "  /blocked                          List blocked IPs  [admin]",
-                "  /unblock <ip>                     Unblock an IP address  [admin]",
-                "  /ratelimit on|off                 Enable/disable rate limiting  [admin]",
-                "  /ratelimit attempts <N>           Set max failed attempts  [admin]",
-                "  /ratelimit window <seconds>       Set the failure counting window  [admin]",
-                "  /ratelimit block <seconds>        Set block duration  [admin]",
-            ]
-            for line in lines:
-                self.chat_area.add_system(line)
+            self._show_help()
             return
 
         if not self.worker:
@@ -1486,6 +2644,46 @@ class ChatWindow(QMainWindow):
             return
 
         self.worker.send_msg({"type": "admin_command", "command": command, "args": args})
+
+    def _show_help(self):
+        everyone = [
+            "  /online                           List connected users",
+            "  /listusers                        List all registered users",
+            "  /listrooms                        List all rooms",
+            "  /setmypassword <new_password>     Change your own password",
+        ]
+        admin_only = [
+            "  /kick <username>                  Kick a user",
+            "  /adduser <username> <pass>        Add a new user",
+            "  /removeuser <username>            Remove a user",
+            "  /addroom <name>                   Create a room",
+            "  /removeroom <name>                Remove a room",
+            "  /setpassword <new_password>       Change server password",
+            "  /setmaxfile <MB>                  Set max file upload size",
+            "  /history on|off                   Enable/disable chat history",
+            "  /makeadmin <username>             Grant admin privileges",
+            "  /removeadmin <username>           Revoke admin privileges",
+            "  /role add <name> [#color]         Create a role",
+            "  /role del <name>                  Delete a role",
+            "  /role rooms <name> [room ...]     Set rooms a role grants",
+            "  /role list                        List roles and members",
+            "  /grantrole <username> <role>      Give a user a role",
+            "  /revokerole <username> <role>     Remove a role from a user",
+            "  /blocked                          List blocked IPs",
+            "  /unblock <ip>                     Unblock an IP address",
+            "  /ratelimit on|off                 Enable/disable rate limiting",
+            "  /ratelimit attempts <N>           Set max failed attempts",
+            "  /ratelimit window <seconds>       Set the failure counting window",
+            "  /ratelimit block <seconds>        Set block duration",
+        ]
+
+        self.chat_area.add_system("Available slash commands:")
+        for line in everyone:
+            self.chat_area.add_system(line)
+        if self.is_admin:
+            self.chat_area.add_system("Admin commands:", color=AMBER)
+            for line in admin_only:
+                self.chat_area.add_system(line)
 
     def _apply_max_file(self, mb: float):
         self.max_file_bytes = int(mb * 1_048_576)
@@ -1495,11 +2693,14 @@ class ChatWindow(QMainWindow):
         if not self.worker or not self.fernet or not self.current_room:
             QMessageBox.information(self, "Not Connected", "Join a room before attaching files.")
             return
-
         path, _ = QFileDialog.getOpenFileName(self, "Attach File or Image")
-        if not path:
-            return
+        if path:
+            self._send_file_path(path)
 
+    def _send_file_path(self, path: str):
+        """Size-check, read, and send a file from disk (attach/drop/paste path)."""
+        if not self.worker or not self.fernet or not self.current_room:
+            return
         try:
             size = os.path.getsize(path)
         except OSError:
@@ -1521,11 +2722,19 @@ class ChatWindow(QMainWindow):
         caption = self.msg_entry.text().strip()
         self.msg_entry.clear()
 
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
             with open(path, "rb") as fh:
                 raw = fh.read()
+        except Exception as exc:
+            QMessageBox.critical(self, "Error", f"Could not read file:\n{exc}")
+            return
+        self._send_file_bytes(raw, filename, mime, caption)
 
+    def _send_file_bytes(self, raw: bytes, filename: str, mime: str, caption: str = ""):
+        if not self.worker or not self.fernet or not self.current_room:
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
             payload: dict = {
                 "filename": filename,
                 "mimetype": mime,
@@ -1534,7 +2743,7 @@ class ChatWindow(QMainWindow):
             if caption:
                 payload["caption"] = caption
 
-            enc = self.fernet.encrypt(json.dumps(payload).encode()).decode()
+            enc = self.fernet.encrypt(pad_plaintext(json.dumps(payload).encode())).decode()
         except Exception as exc:
             QMessageBox.critical(self, "Error", f"Could not prepare file:\n{exc}")
             return

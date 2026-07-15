@@ -6,6 +6,7 @@ Usage: python server.py [--host HOST] [--port PORT] [--config CONFIG]
 """
 
 import asyncio
+import base64
 import json
 import hashlib
 import hmac
@@ -42,6 +43,9 @@ PBKDF2_ITERATIONS = 600_000
 
 USERNAME_RE = re.compile(r"[A-Za-z0-9_.-]{1,32}")
 ROOM_NAME_RE = re.compile(r"[A-Za-z0-9_.\- ]{1,50}")
+
+PROFILE_BIO_MAX_CHARS = 300
+PROFILE_IMAGE_MAX_B64 = 400_000   # ~300 KB raw image, base64-encoded
 
 
 def valid_username(name: str) -> bool:
@@ -98,12 +102,21 @@ class ChatServer:
         self.ssl_context = ssl_context
         self.config_file = config_file
         self.history_file = os.path.splitext(config_file)[0] + "_history.json"
+        self.profiles_file = os.path.splitext(config_file)[0] + "_profiles.json"
         self.data = self._load_data()
+        self.profiles = self._load_profiles()
         self.connected_clients: dict = {}  # websocket -> {"username": str, "rooms": set}
         self.room_clients: dict = {}       # room_name -> set of websockets
         self.room_history: dict = {}       # room_name -> list of message dicts
+        # room -> {id: entry} for recent messages, so edit/delete/react/pin can
+        # verify ownership even when history persistence is off. In-memory only.
+        self._recent_msgs: dict = {}
         self._failed_attempts: dict = {}   # ip -> [timestamp, ...]
-        self._blocked_ips: dict = {}       # ip -> unblock_timestamp
+        # ip -> unblock_timestamp; persisted so blocks survive a restart
+        self._blocked_ips: dict = {
+            ip: until for ip, until in self.data.get("blocked_ips", {}).items()
+            if until > time.time()
+        }
         self._init_rooms()
         self._load_history()
 
@@ -116,14 +129,24 @@ class ChatServer:
             data.setdefault("roles", {})
             data.setdefault("user_roles", {})
             data.setdefault("persist_files", True)
+            data.setdefault("blocked_ips", {})
+            data.setdefault("pins", {})
+            if "kdf_salt" not in data:
+                data["kdf_salt"] = secrets.token_hex(16)
+                self._save_data(data)
             return data
         data = {
             "server_password": hash_password("changeme"),
+            # Random per-server salt clients use to derive the message key;
+            # not secret, but defeats precomputed key tables shared across servers.
+            "kdf_salt": secrets.token_hex(16),
             "users": {},
             "rooms": ["General"],
             "admins": [],
             "roles": {},          # role_name -> {"color": "#hex", "rooms": [granted rooms]}
             "user_roles": {},     # username -> [role_name, ...]
+            "blocked_ips": {},    # ip -> unblock unix timestamp
+            "pins": {},           # room -> [pinned message entries]
             "max_file_mb": 8,
             "history_enabled": False,
             "persist_files": True,   # keep shared files in history so they survive disconnects
@@ -176,6 +199,29 @@ class ChatServer:
     def _save_history(self):
         self._atomic_write_json(self.history_file, self.room_history)
 
+    def _load_profiles(self) -> dict:
+        """Profiles live in their own file: they can carry base64 images, and
+        keeping them out of the config avoids rewriting a large JSON on every
+        unrelated settings change (and vice versa)."""
+        profiles = {}
+        if os.path.exists(self.profiles_file):
+            try:
+                with open(self.profiles_file) as f:
+                    profiles = json.load(f)
+            except Exception:
+                profiles = {}
+        # Migrate profiles stored inside the config by earlier versions
+        legacy = self.data.pop("profiles", None)
+        if legacy:
+            for uname, prof in legacy.items():
+                profiles.setdefault(uname, prof)
+            self._atomic_write_json(self.profiles_file, profiles)
+            self._save_data()
+        return profiles
+
+    def _save_profiles(self):
+        self._atomic_write_json(self.profiles_file, self.profiles)
+
     def _append_history(self, room: str, entry: dict):
         is_file = entry.get("type") == "file_message"
         # Files persist independently of the text-history toggle so shared
@@ -191,6 +237,44 @@ class ChatServer:
         if limit > 0 and len(self.room_history[room]) > limit:
             self.room_history[room] = self.room_history[room][-limit:]
         self._save_history()
+
+    def _track_recent(self, room: str, entry: dict, cap: int = 300):
+        recent = self._recent_msgs.setdefault(room, {})
+        recent[entry["id"]] = entry
+        while len(recent) > cap:
+            recent.pop(next(iter(recent)))
+
+    def _find_recent(self, room: str, mid) -> dict | None:
+        if not isinstance(mid, str):
+            return None
+        return self._recent_msgs.get(room, {}).get(mid)
+
+    def _sync_history_entry(self, room: str, mid: str, remove: bool = False):
+        """Persist an in-place mutation of (or remove) a stored history entry.
+        Recent entries and history entries share dict objects, so edits are
+        already visible — this just writes the file / drops the row."""
+        hist = self.room_history.get(room, [])
+        for i, e in enumerate(hist):
+            if e.get("id") == mid:
+                if remove:
+                    hist.pop(i)
+                self._save_history()
+                return
+
+    def _sync_pin_entry(self, room: str, mid: str, content=None, remove: bool = False) -> bool:
+        """Update or remove a pinned copy of a message. Returns True if changed."""
+        pins = self.data.get("pins", {}).get(room, [])
+        for i, p in enumerate(pins):
+            if p.get("id") == mid:
+                if remove:
+                    pins.pop(i)
+                else:
+                    if content is not None:
+                        p["content"] = content
+                    p["edited"] = True
+                self._save_data()
+                return True
+        return False
 
     # -------------------------------------------------------------------------
     # Rate limiting
@@ -210,8 +294,17 @@ class ChatServer:
         if remaining <= 0:
             del self._blocked_ips[ip]
             self._failed_attempts.pop(ip, None)
+            self._persist_blocks()
             return None
         return remaining
+
+    def _persist_blocks(self):
+        """Mirror active IP blocks into the config so they survive a restart."""
+        now = time.time()
+        self.data["blocked_ips"] = {
+            ip: until for ip, until in self._blocked_ips.items() if until > now
+        }
+        self._save_data()
 
     def _record_failure(self, ip: str):
         """Record a failed auth attempt; block the IP if the threshold is reached."""
@@ -231,21 +324,29 @@ class ChatServer:
 
         if len(self._failed_attempts[ip]) >= threshold:
             self._blocked_ips[ip] = now + block_dur
+            self._persist_blocks()
             log.warning("IP %s blocked for %ss after %s failed attempts", ip, block_dur, threshold)
 
     def _clear_failures(self, ip: str):
         """Clear failure history for an IP on successful login."""
         self._failed_attempts.pop(ip, None)
 
-    def _flood_allow(self, client_info: dict) -> bool:
-        """Sliding-window flood limiter for an authenticated connection."""
+    def _flood_allow(self, client_info: dict, key: str = "msg_times",
+                     limit: int | None = None, window: int | None = None) -> bool:
+        """Sliding-window flood limiter for an authenticated connection.
+
+        `key` selects an independent bucket on the connection so chatty but
+        cheap request types (profile reads) don't starve normal messaging.
+        """
         cfg = self.data.get("flood", {})
-        limit = cfg.get("max_messages", 15)
-        window = cfg.get("window_seconds", 10)
+        if limit is None:
+            limit = cfg.get("max_messages", 15)
+        if window is None:
+            window = cfg.get("window_seconds", 10)
         if limit <= 0:
             return True
         now = time.time()
-        times = client_info.setdefault("msg_times", [])
+        times = client_info.setdefault(key, [])
         times[:] = [t for t in times if t > now - window]
         if len(times) >= limit:
             return False
@@ -289,6 +390,14 @@ class ChatServer:
 
     def _role_colors(self) -> dict:
         return {name: rd.get("color", "#8d919b") for name, rd in self.data.get("roles", {}).items()}
+
+    def _get_profile(self, username: str) -> dict:
+        prof = self.profiles.get(username, {})
+        return {
+            "bio": prof.get("bio", ""),
+            "avatar": prof.get("avatar"),
+            "banner": prof.get("banner"),
+        }
 
     def _roles_snapshot_for_room(self, room: str) -> dict:
         """{username: [roles]} for the connected users currently in a room."""
@@ -365,9 +474,13 @@ class ChatServer:
         return True, f"Revoked '{role}' from '{username}'"
 
     def _prune_room_from_roles(self, room: str):
+        """Drop every reference to a removed room: role grants, pinned
+        messages, and the in-memory recent-message index."""
         for rd in self.data.get("roles", {}).values():
             if room in rd.get("rooms", []):
                 rd["rooms"].remove(room)
+        self.data.get("pins", {}).pop(room, None)
+        self._recent_msgs.pop(room, None)
 
     def _roles_report(self) -> str:
         roles = self.data.get("roles", {})
@@ -508,6 +621,7 @@ class ChatServer:
                 "type": "auth_result",
                 "success": True,
                 "message": f"Welcome, {username}!",
+                "kdf_salt": self.data["kdf_salt"],
                 "rooms": self._accessible_rooms(username),
                 "max_file_mb": self.data.get("max_file_mb", 8),
                 "is_admin": self._is_admin(username),
@@ -540,9 +654,37 @@ class ChatServer:
                     }, exclude=websocket)
             del self.connected_clients[websocket]
 
+    # Message types that can amplify (broadcasts, large responses) or write to
+    # disk; chat messages have their own check inline so the error text differs.
+    _FLOOD_LIMITED = frozenset({
+        "join_room", "leave_room", "list_rooms", "list_users",
+        "update_profile", "admin_command",
+        "edit_message", "delete_message", "react",
+        "pin_message", "unpin_message", "get_pins",
+    })
+
     async def _handle_message(self, websocket, client_info, msg):
         msg_type = msg.get("type")
         username = client_info["username"]
+
+        # typing pings are frequent and harmless — separate bucket, dropped
+        # silently on overflow so the sender gets no error spam.
+        if msg_type == "typing":
+            if not self._flood_allow(client_info, key="typing_times", limit=15, window=10):
+                return
+        # get_profile gets its own generous bucket: clients legitimately
+        # prefetch one profile per user when joining a room.
+        elif msg_type == "get_profile":
+            if not self._flood_allow(client_info, key="profile_times", limit=60, window=10):
+                await websocket.send(json.dumps({
+                    "type": "error", "message": "Too many requests — slow down"
+                }))
+                return
+        elif msg_type in self._FLOOD_LIMITED and not self._flood_allow(client_info):
+            await websocket.send(json.dumps({
+                "type": "error", "message": "Too many requests — slow down"
+            }))
+            return
 
         if msg_type == "list_rooms":
             await websocket.send(json.dumps({
@@ -637,6 +779,7 @@ class ChatServer:
             out_type = "room_message" if msg_type == "send_message" else "file_message"
             entry = {
                 "type": out_type,
+                "id": secrets.token_hex(8),
                 "room": room,
                 "username": username,
                 "content": content,
@@ -645,6 +788,19 @@ class ChatServer:
             await self._broadcast_room(room, entry)
             # Persist text (when history is on) and files (when persist_files is on)
             self._append_history(room, entry)
+            self._track_recent(room, entry)
+            # Unread ping for connected users with access who aren't in the room.
+            # Deliberately content-free: just "something happened in this room".
+            activity = json.dumps({"type": "room_activity", "room": room})
+            for ws2, info2 in list(self.connected_clients.items()):
+                uname2 = info2.get("username")
+                if (not uname2 or ws2 is websocket or room in info2["rooms"]
+                        or not self._can_access(uname2, room)):
+                    continue
+                try:
+                    await ws2.send(activity)
+                except Exception:
+                    pass
 
         elif msg_type == "list_users":
             room = msg.get("room")
@@ -660,13 +816,167 @@ class ChatServer:
                     "roles": self._role_colors(),
                 }))
 
+        elif msg_type == "edit_message":
+            room, mid = msg.get("room"), msg.get("id")
+            content = msg.get("content", "")
+            entry = self._find_recent(room, mid)
+            if (not entry or entry.get("username") != username
+                    or entry.get("type") != "room_message"):
+                await websocket.send(json.dumps({"type": "error", "message": "Cannot edit that message"}))
+                return
+            if not content or not isinstance(content, str):
+                return
+            max_chars = self.data.get("max_message_chars", 20000)
+            if max_chars > 0 and len(content) > max_chars:
+                await websocket.send(json.dumps({"type": "error", "message": "Message is too long"}))
+                return
+            entry["content"] = content
+            entry["edited"] = True
+            self._sync_history_entry(room, mid)
+            self._sync_pin_entry(room, mid, content)
+            await self._broadcast_room(room, {
+                "type": "message_edited", "room": room, "id": mid, "content": content,
+            })
+
+        elif msg_type == "delete_message":
+            room, mid = msg.get("room"), msg.get("id")
+            entry = self._find_recent(room, mid)
+            if not entry or (entry.get("username") != username and not self._is_admin(username)):
+                await websocket.send(json.dumps({"type": "error", "message": "Cannot delete that message"}))
+                return
+            self._recent_msgs.get(room, {}).pop(mid, None)
+            self._sync_history_entry(room, mid, remove=True)
+            self._sync_pin_entry(room, mid, remove=True)
+            await self._broadcast_room(room, {"type": "message_deleted", "room": room, "id": mid})
+
+        elif msg_type == "react":
+            room, mid = msg.get("room"), msg.get("id")
+            emoji = msg.get("emoji", "")
+            if not isinstance(emoji, str) or not (1 <= len(emoji) <= 8):
+                return
+            entry = self._find_recent(room, mid)
+            if not entry or room not in client_info["rooms"]:
+                return
+            reactions = entry.setdefault("reactions", {})
+            users = reactions.setdefault(emoji, [])
+            if username in users:
+                users.remove(username)
+                if not users:
+                    del reactions[emoji]
+            elif len(reactions) <= 20:  # cap distinct emoji per message
+                users.append(username)
+            self._sync_history_entry(room, mid)
+            await self._broadcast_room(room, {
+                "type": "reaction_update", "room": room, "id": mid, "reactions": reactions,
+            })
+
+        elif msg_type == "typing":
+            room = msg.get("room")
+            if room in client_info["rooms"]:
+                await self._broadcast_room(room, {
+                    "type": "typing", "room": room, "username": username,
+                }, exclude=websocket)
+
+        elif msg_type in ("pin_message", "unpin_message"):
+            room, mid = msg.get("room"), msg.get("id")
+            if not self._is_admin(username):
+                await websocket.send(json.dumps({"type": "error", "message": "Only admins can pin messages"}))
+                return
+            if msg_type == "unpin_message":
+                if self._sync_pin_entry(room, mid, remove=True):
+                    await self._broadcast_room(room, {
+                        "type": "system_message", "content": f"{username} unpinned a message",
+                    })
+                return
+            entry = self._find_recent(room, mid)
+            if not entry or entry.get("type") != "room_message":
+                await websocket.send(json.dumps({"type": "error", "message": "Cannot pin that message"}))
+                return
+            pins = self.data.setdefault("pins", {}).setdefault(room, [])
+            if any(p.get("id") == mid for p in pins):
+                return
+            if len(pins) >= 50:
+                await websocket.send(json.dumps({"type": "error", "message": "Pin limit reached for this room"}))
+                return
+            pins.append(entry)
+            self._save_data()
+            await self._broadcast_room(room, {
+                "type": "system_message", "content": f"{username} pinned a message",
+            })
+            log.info("[Admin] %s pinned message %s in %s", username, mid, room)
+
+        elif msg_type == "get_pins":
+            room = msg.get("room")
+            if room in client_info["rooms"]:
+                await websocket.send(json.dumps({
+                    "type": "pins_list", "room": room,
+                    "pins": self.data.get("pins", {}).get(room, []),
+                }))
+
+        elif msg_type == "get_profile":
+            target = msg.get("username", "")
+            if not isinstance(target, str) or target not in self.data.get("users", {}):
+                # Don't echo the requested name back: it is unbounded,
+                # attacker-controlled text.
+                await websocket.send(json.dumps({"type": "error", "message": "Unknown user"}))
+                return
+            profile = self._get_profile(target)
+            await websocket.send(json.dumps({
+                "type": "profile",
+                "username": target,
+                "bio": profile["bio"],
+                "avatar": profile["avatar"],
+                "banner": profile["banner"],
+                "roles": self._user_roles(target),
+                "is_admin": self._is_admin(target),
+            }))
+
+        elif msg_type == "update_profile":
+            bio = msg.get("bio", "")
+            if not isinstance(bio, str):
+                bio = ""
+            bio = bio[:PROFILE_BIO_MAX_CHARS]
+            avatar = msg.get("avatar")
+            banner = msg.get("banner")
+            for name, value in (("avatar", avatar), ("banner", banner)):
+                if value is None:
+                    continue
+                if not isinstance(value, str) or len(value) > PROFILE_IMAGE_MAX_B64:
+                    await websocket.send(json.dumps({
+                        "type": "profile_update_result", "success": False,
+                        "message": f"{name.capitalize()} image is too large",
+                    }))
+                    return
+                try:
+                    base64.b64decode(value, validate=True)
+                except Exception:
+                    await websocket.send(json.dumps({
+                        "type": "profile_update_result", "success": False,
+                        "message": f"{name.capitalize()} image is not valid data",
+                    }))
+                    return
+            self.profiles[username] = {
+                "bio": bio, "avatar": avatar, "banner": banner,
+            }
+            self._save_profiles()
+            await websocket.send(json.dumps({
+                "type": "profile_update_result", "success": True, "message": "Profile saved",
+            }))
+            # Let anyone with this user's card open right now pick up the change
+            await self._broadcast_all({
+                "type": "profile", "username": username,
+                "bio": bio, "avatar": avatar, "banner": banner,
+                "roles": self._user_roles(username), "is_admin": self._is_admin(username),
+            })
+
         elif msg_type == "admin_command":
             command = msg.get("command", "").lower()
             args = msg.get("args", [])
             await self._handle_admin_command(websocket, username, command, args)
 
     async def _handle_admin_command(self, websocket, requester: str, command: str, args: list):
-        INFO_COMMANDS = {"online", "listusers", "listrooms"}
+        # Commands any authenticated user may run
+        INFO_COMMANDS = {"online", "listusers", "listrooms", "setmypassword"}
         is_admin = requester in self.data.get("admins", [])
 
         if command not in INFO_COMMANDS and not is_admin:
@@ -693,6 +1003,14 @@ class ChatServer:
         elif command == "listrooms":
             rooms = self.data["rooms"]
             await ok("Rooms: " + (", ".join(rooms) if rooms else "(none)"))
+
+        elif command == "setmypassword":
+            if not args:
+                await err("Usage: /setmypassword <new_password>"); return
+            self.data["users"][requester] = hash_password(args[0])
+            self._save_data()
+            await ok("Your password has been updated")
+            log.info("%s changed their password", requester)
 
         elif command == "kick":
             if not args:
@@ -730,6 +1048,8 @@ class ChatServer:
             if uname not in self.data["users"]:
                 await err(f"User '{uname}' not found"); return
             del self.data["users"][uname]
+            if self.profiles.pop(uname, None) is not None:
+                self._save_profiles()
             self._save_data()
             await ok(f"User '{uname}' removed")
             log.info(f"[Admin] {requester} removed user '{uname}'")
@@ -899,6 +1219,7 @@ class ChatServer:
             if ip in self._blocked_ips:
                 del self._blocked_ips[ip]
                 self._failed_attempts.pop(ip, None)
+                self._persist_blocks()
                 await ok(f"IP {ip} unblocked")
                 log.info(f"[Admin] {requester} unblocked {ip}")
             else:
@@ -1054,6 +1375,8 @@ class ChatServer:
         self.data.get("user_roles", {}).pop(uname, None)
         if uname in self.data.get("admins", []):
             self.data["admins"].remove(uname)
+        if self.profiles.pop(uname, None) is not None:
+            self._save_profiles()
         self._save_data()
         await self.gui_kick(uname)
         return f"User '{uname}' removed"
@@ -1159,6 +1482,7 @@ class ChatServer:
             return "Enter an IP address"
         dur = self.data.get("rate_limit", {}).get("block_seconds", 300)
         self._blocked_ips[ip] = time.time() + dur
+        self._persist_blocks()
         dropped = 0
         for ws, info in list(self.connected_clients.items()):
             try:
@@ -1174,6 +1498,7 @@ class ChatServer:
         if ip in self._blocked_ips:
             del self._blocked_ips[ip]
             self._failed_attempts.pop(ip, None)
+            self._persist_blocks()
             return f"Unblocked {ip}"
         return f"{ip} is not blocked"
 
@@ -1270,6 +1595,8 @@ class ChatServer:
                 print(f"User '{username}' not found")
                 return
             del self.data["users"][username]
+            if self.profiles.pop(username, None) is not None:
+                self._save_profiles()
             self._save_data()
             print(f"User '{username}' removed")
 
@@ -1460,6 +1787,7 @@ class ChatServer:
             if ip in self._blocked_ips:
                 del self._blocked_ips[ip]
                 self._failed_attempts.pop(ip, None)
+                self._persist_blocks()
                 print(f"IP {ip} unblocked")
             else:
                 print(f"IP {ip} is not blocked")
