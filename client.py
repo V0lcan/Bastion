@@ -176,6 +176,51 @@ def _md_inline(text: str) -> str:
     return "".join(out)
 
 
+def _insert_soft_breaks(html: str, every: int = 20) -> str:
+    """Insert invisible break points (U+200B) into long unbroken runs of
+    non-whitespace so QLabel's word-wrap has somewhere to break — otherwise a
+    single long token (no spaces, e.g. a wall of the same character or a long
+    URL) overflows the label's width instead of wrapping. Skips HTML tags and
+    entity references so markup is never split apart."""
+    out: list[str] = []
+    in_tag = in_entity = False
+    run = 0
+    for ch in html:
+        if in_tag:
+            out.append(ch)
+            if ch == ">":
+                in_tag = False
+            continue
+        if ch == "<":
+            in_tag = True
+            out.append(ch)
+            run = 0
+            continue
+        if in_entity:
+            out.append(ch)
+            if ch == ";":
+                in_entity = False
+                run += 1
+                if run >= every:
+                    out.append("​")
+                    run = 0
+            continue
+        if ch == "&":
+            in_entity = True
+            out.append(ch)
+            continue
+        if ch.isspace():
+            out.append(ch)
+            run = 0
+            continue
+        out.append(ch)
+        run += 1
+        if run >= every:
+            out.append("​")
+            run = 0
+    return "".join(out)
+
+
 def markdown_to_html(text: str) -> str:
     """Convert Discord-style markdown to Qt-compatible HTML."""
     # Split on fenced code blocks first — their contents are left untouched
@@ -634,7 +679,7 @@ class MessageWidget(QFrame):
         lbl.setStyleSheet(
             f"color: {self._text_color}; background: transparent; line-height: 140%;"
         )
-        lbl.setText(markdown_to_html(text))
+        lbl.setText(_insert_soft_breaks(markdown_to_html(text)))
         self._lay.addWidget(lbl)
         return self
 
