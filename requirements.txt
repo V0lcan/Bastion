@@ -1,0 +1,11 @@
+# Bastion dependencies
+#
+# Headless CLI server (python server.py) needs only:
+websockets>=12
+#
+# Client (client.py) and the server's graphical console (server.py --gui) also need:
+PyQt6>=6.5
+cryptography>=42        # client only: Fernet + PBKDF2 message encryption
+#
+# Optional: enables argon2id password hashing on the server (PBKDF2 is used if absent)
+# argon2-cffi>=23
