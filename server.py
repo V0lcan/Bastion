@@ -785,6 +785,11 @@ class ChatServer:
                 "content": content,
                 "timestamp": timestamp,
             }
+            # Opaque id of the message being replied to; clients render the
+            # quote from their own decrypted copy.
+            reply_to = msg.get("reply_to")
+            if isinstance(reply_to, str) and 1 <= len(reply_to) <= 32:
+                entry["reply_to"] = reply_to
             await self._broadcast_room(room, entry)
             # Persist text (when history is on) and files (when persist_files is on)
             self._append_history(room, entry)

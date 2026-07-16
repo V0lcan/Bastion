@@ -28,7 +28,7 @@ try:
     )
     from PyQt6.QtGui import (
         QFont, QColor, QPixmap, QMovie, QTextCursor, QPainter, QPainterPath,
-        QGuiApplication, QIcon, QImage,
+        QGuiApplication, QIcon, QImage, QShortcut, QKeySequence,
     )
 except ImportError:
     _missing.append("PyQt6")
@@ -863,12 +863,14 @@ class MessageWidget(QFrame):
     delete_requested = pyqtSignal(str)
     react_requested = pyqtSignal(str, str)   # (msg_id, emoji)
     pin_requested = pyqtSignal(str)
+    reply_requested = pyqtSignal(str)
 
     def __init__(self, username: str | None, timestamp: str | None,
                  is_self: bool = False, dim: bool = False,
                  role: tuple[str, str] | None = None,
                  avatar_b64: str | None = None,
-                 msg_id: str | None = None):
+                 msg_id: str | None = None,
+                 show_header: bool = True):
         super().__init__()
         self.msg_id = msg_id
         self.author = username or ""
@@ -892,7 +894,8 @@ class MessageWidget(QFrame):
         self._dim = dim          # True for replayed history messages
         self._text_color = MUTED if dim else "#dbdee1"
 
-        if username:
+        header = bool(username) and show_header
+        if header:
             avatar = QLabel()
             avatar.setFixedSize(40, 40)
             avatar_px = None if dim else b64_to_pixmap(avatar_b64)
@@ -908,13 +911,17 @@ class MessageWidget(QFrame):
                     " font-weight: bold; font-size: 15pt;"
                 )
             outer.addWidget(avatar, 0, Qt.AlignmentFlag.AlignTop)
+        elif username:
+            # Grouped continuation row: align the body under the header
+            # message's text column (40px avatar + 14px spacing).
+            outer.addSpacing(54)
 
         self._lay = QVBoxLayout()
         self._lay.setContentsMargins(0, 0, 0, 0)
         self._lay.setSpacing(2)
         outer.addLayout(self._lay, 1)
 
-        if username:
+        if header:
             hrow = QHBoxLayout()
             hrow.setContentsMargins(0, 0, 0, 0)
             hrow.setSpacing(8)
@@ -960,9 +967,27 @@ class MessageWidget(QFrame):
             self.plaintext = text
         return self
 
+    def add_quote(self, text: str) -> "MessageWidget":
+        """Small quoted-reply header shown above the message body."""
+        lbl = QLabel(text)
+        lbl.setWordWrap(True)
+        lbl.setTextFormat(Qt.TextFormat.PlainText)
+        lbl.setStyleSheet(
+            f"color: {MUTED}; font-size: 8pt; background: transparent;"
+            f" border-left: 2px solid {ACCENT}; padding-left: 6px;"
+        )
+        self._lay.addWidget(lbl)
+        return self
+
     def mark_edited(self):
-        if self._edited_lbl:
-            self._edited_lbl.show()
+        if self._edited_lbl is None:
+            # Grouped rows have no header line; add a tiny inline marker
+            self._edited_lbl = QLabel("(edited)")
+            self._edited_lbl.setStyleSheet(
+                f"color: {MUTED}; font-size: 8pt; font-style: italic; background: transparent;"
+            )
+            self._lay.addWidget(self._edited_lbl)
+        self._edited_lbl.show()
 
     def update_text(self, plaintext: str):
         self.plaintext = plaintext
@@ -1018,13 +1043,18 @@ class MessageWidget(QFrame):
         self._react_row.show()
 
     def contextMenuEvent(self, event):
-        if not self.msg_id:
-            return
         menu = QMenu(self)
-        react_menu = menu.addMenu("React")
-        for e in REACTION_EMOJI:
-            react_menu.addAction(
-                e, lambda em=e: self.react_requested.emit(self.msg_id, em)
+        if self.msg_id:
+            menu.addAction("Reply", lambda: self.reply_requested.emit(self.msg_id))
+            react_menu = menu.addMenu("React")
+            for e in REACTION_EMOJI:
+                react_menu.addAction(
+                    e, lambda em=e: self.react_requested.emit(self.msg_id, em)
+                )
+        if self.plaintext:
+            menu.addAction(
+                "Copy Text",
+                lambda: QGuiApplication.clipboard().setText(self.plaintext),
             )
         if self._can_edit:
             menu.addAction("Edit", lambda: self.edit_requested.emit(self.msg_id))
@@ -1032,7 +1062,8 @@ class MessageWidget(QFrame):
             menu.addAction("Pin", lambda: self.pin_requested.emit(self.msg_id))
         if self._can_delete:
             menu.addAction("Delete", lambda: self.delete_requested.emit(self.msg_id))
-        menu.exec(event.globalPos())
+        if menu.actions():
+            menu.exec(event.globalPos())
 
     def add_image(self, data: bytes, filename: str, mimetype: str) -> "MessageWidget":
         if mimetype == "image/gif":
@@ -1127,6 +1158,14 @@ class ChatArea(QScrollArea):
                 w.deleteLater()
         self._notice.hide()
         self._pinned = True
+
+    def widgets(self) -> list:
+        out = []
+        for i in range(self._vbox.count()):
+            w = self._vbox.itemAt(i).widget()
+            if w is not None:
+                out.append(w)
+        return out
 
     def _at_bottom(self) -> bool:
         vsb = self.verticalScrollBar()
@@ -1654,6 +1693,12 @@ class ChatWindow(QMainWindow):
         # Message actions / ambient state
         self._msg_widgets: dict[str, MessageWidget] = {}   # msg id -> widget (current room)
         self._editing_id: str | None = None
+        self._reply_to: str | None = None
+        # Grouping / day-separator trackers for the current room's render
+        self._last_author: str | None = None
+        self._last_ts: datetime.datetime | None = None
+        self._last_dim: bool | None = None
+        self._last_date: datetime.date | None = None
         self.unread: dict[str, int] = {}                   # room -> unread count
         self._typers: dict[str, float] = {}                # username -> expiry time
         self._typing_prune = QTimer(self)
@@ -1796,6 +1841,15 @@ class ChatWindow(QMainWindow):
         sep.setStyleSheet(f"background:{BORDER}; border:none;")
         cp_lay.addWidget(sep)
 
+        self.search_bar = QLineEdit()
+        self.search_bar.setPlaceholderText("Search messages…   (Esc to close)")
+        self.search_bar.textChanged.connect(self._apply_search)
+        self.search_bar.hide()
+        cp_lay.addWidget(self.search_bar)
+        QShortcut(QKeySequence.StandardKey.Find, self, activated=self._toggle_search)
+        QShortcut(QKeySequence("Escape"), self.search_bar, activated=self._close_search,
+                  context=Qt.ShortcutContext.WidgetShortcut)
+
         self.chat_area = ChatArea()
         cp_lay.addWidget(self.chat_area, 1)
 
@@ -1805,6 +1859,13 @@ class ChatWindow(QMainWindow):
         )
         self.edit_banner.hide()
         cp_lay.addWidget(self.edit_banner)
+
+        self.reply_banner = QLabel("")
+        self.reply_banner.setStyleSheet(
+            f"background: {ELEV}; color: {OTHER_NAME}; font-size: 8pt; padding: 3px 10px;"
+        )
+        self.reply_banner.hide()
+        cp_lay.addWidget(self.reply_banner)
 
         self.typing_label = QLabel("")
         self.typing_label.setFixedHeight(18)
@@ -1837,7 +1898,7 @@ class ChatWindow(QMainWindow):
         self.msg_entry.send_requested.connect(self._send_message)
         self.msg_entry.history_prev.connect(self._history_up)
         self.msg_entry.history_next.connect(self._history_down)
-        self.msg_entry.edit_cancelled.connect(self._cancel_edit)
+        self.msg_entry.edit_cancelled.connect(self._on_input_escape)
         self.msg_entry.image_pasted.connect(self._send_pasted_image)
         self.msg_entry.files_pasted.connect(self._send_dropped_files)
         self.msg_entry.textChanged.connect(self._maybe_send_typing)
@@ -1863,7 +1924,15 @@ class ChatWindow(QMainWindow):
     # -----------------------------------------------------------------------
 
     def _show_connect_dialog(self):
-        dlg = ConnectDialog(self, prefill=self.connect_params or None)
+        # Prefill from this session, else from the last successful connection
+        # (host/port/username/TLS only — passwords are never stored).
+        prefill = self.connect_params or {
+            "host":     str(self.settings.value("last_host", "localhost")),
+            "port":     str(self.settings.value("last_port", "8765")),
+            "username": str(self.settings.value("last_username", "")),
+            "use_tls":  self.settings.value("last_tls", False, type=bool),
+        }
+        dlg = ConnectDialog(self, prefill=prefill)
         if dlg.exec() == QDialog.DialogCode.Accepted and dlg.result_data:
             self._connect(dlg.result_data)
 
@@ -1910,6 +1979,10 @@ class ChatWindow(QMainWindow):
         self._manual_disconnect = False
         self.connect_params = params
         self.username = params["username"]
+        self.settings.setValue("last_host", params["host"])
+        self.settings.setValue("last_port", params["port"])
+        self.settings.setValue("last_username", params["username"])
+        self.settings.setValue("last_tls", params.get("use_tls", False))
         # Message key: prefer the dedicated passphrase (never sent to the
         # server) and fall back to the server password for compatibility.
         # The Fernet itself is built on auth_result, once the server has
@@ -1959,6 +2032,8 @@ class ChatWindow(QMainWindow):
         self._typers.clear()
         self.typing_label.setText("")
         self._cancel_edit()
+        self._cancel_reply()
+        self._reset_message_flow()
 
     # -----------------------------------------------------------------------
     # Incoming message dispatch
@@ -2041,6 +2116,8 @@ class ChatWindow(QMainWindow):
                 self.chat_area.clear_all()
                 self._msg_widgets.clear()
                 self._cancel_edit()
+                self._cancel_reply()
+                self._reset_message_flow()
                 self.room_title.setText("Select a room")
 
         elif t == "room_message":
@@ -2187,11 +2264,33 @@ class ChatWindow(QMainWindow):
             content = "[unable to decrypt]"
         is_self = msg["username"] == self.username
         mid = msg.get("id")
+        sep_added = self._maybe_day_separator(msg.get("timestamp"))
+        ts_dt = self._parse_ts(msg.get("timestamp"))
+        grouped = (
+            not sep_added
+            and not msg.get("reply_to")
+            and self._last_author == msg["username"]
+            and self._last_dim == historical
+            and ts_dt is not None and self._last_ts is not None
+            and (ts_dt - self._last_ts).total_seconds() < 300
+        )
         mw = MessageWidget(msg["username"], msg["timestamp"], is_self, dim=historical,
                            role=self._primary_role(msg["username"]),
                            avatar_b64=self._avatar_for(msg["username"]),
-                           msg_id=mid)
+                           msg_id=mid, show_header=not grouped)
+        mw.author = msg["username"]
+        reply_to = msg.get("reply_to")
+        if reply_to:
+            orig = self._msg_widgets.get(reply_to)
+            if orig is not None:
+                excerpt = orig.plaintext.replace("\n", " ")[:100]
+                mw.add_quote(f"↩ {orig.author}: {excerpt}")
+            else:
+                mw.add_quote("↩ (original message unavailable)")
         mw.add_text(content)
+        self._last_author = msg["username"]
+        self._last_ts = ts_dt
+        self._last_dim = historical
         mw._can_edit = is_self and bool(mid)
         mw._can_delete = bool(mid) and (is_self or self.is_admin)
         mw._can_pin = bool(mid) and self.is_admin
@@ -2246,8 +2345,12 @@ class ChatWindow(QMainWindow):
             return
 
         mid = msg.get("id")
+        self._maybe_day_separator(msg.get("timestamp"))
         mw = MessageWidget(msg["username"], msg["timestamp"], is_self, dim=historical,
                            role=role, avatar_b64=avatar_b64, msg_id=mid)
+        self._last_author = msg["username"]
+        self._last_ts = self._parse_ts(msg.get("timestamp"))
+        self._last_dim = historical
         if caption:
             mw.add_text(caption)
         if mimetype in IMAGE_MIME:
@@ -2271,6 +2374,36 @@ class ChatWindow(QMainWindow):
         mw.delete_requested.connect(self._delete_message)
         mw.react_requested.connect(self._send_react)
         mw.pin_requested.connect(self._pin_message)
+        mw.reply_requested.connect(self._start_reply)
+
+    @staticmethod
+    def _parse_ts(ts: str | None) -> datetime.datetime | None:
+        if not ts:
+            return None
+        try:
+            dt = datetime.datetime.fromisoformat(ts)
+            if dt.tzinfo is not None:
+                dt = dt.astimezone()
+            return dt
+        except ValueError:
+            return None
+
+    def _maybe_day_separator(self, ts: str | None) -> bool:
+        """Insert a '─── Monday, 14 July 2026 ───' line when the day changes."""
+        dt = self._parse_ts(ts)
+        if dt is None:
+            return False
+        if dt.date() != self._last_date:
+            self._last_date = dt.date()
+            self.chat_area.add_system(f"───  {dt:%A, %d %B %Y}  ───", color=MUTED)
+            return True
+        return False
+
+    def _reset_message_flow(self):
+        self._last_author = None
+        self._last_ts = None
+        self._last_dim = None
+        self._last_date = None
 
     # -----------------------------------------------------------------------
     # Message actions (edit / delete / react / pin)
@@ -2290,6 +2423,52 @@ class ChatWindow(QMainWindow):
             self._editing_id = None
             self.msg_entry.clear()
         self.edit_banner.hide()
+
+    def _start_reply(self, mid: str):
+        w = self._msg_widgets.get(mid)
+        if not w or not self.worker:
+            return
+        self._cancel_edit()
+        self._reply_to = mid
+        self.reply_banner.setText(f"  ↩  Replying to {w.author} — press Esc to cancel")
+        self.reply_banner.show()
+        self.msg_entry.setFocus()
+
+    def _cancel_reply(self):
+        self._reply_to = None
+        self.reply_banner.hide()
+
+    def _on_input_escape(self):
+        if self._editing_id:
+            self._cancel_edit()
+        elif self._reply_to:
+            self._cancel_reply()
+
+    # -----------------------------------------------------------------------
+    # Client-side message search (Ctrl+F)
+    # -----------------------------------------------------------------------
+
+    def _toggle_search(self):
+        if self.search_bar.isVisible():
+            self._close_search()
+        else:
+            self.search_bar.show()
+            self.search_bar.setFocus()
+
+    def _close_search(self):
+        self.search_bar.clear()
+        self.search_bar.hide()
+        self.msg_entry.setFocus()
+
+    def _apply_search(self, term: str):
+        term = term.strip().lower()
+        for w in self.chat_area.widgets():
+            if isinstance(w, MessageWidget):
+                w.setVisible(not term or term in w.plaintext.lower()
+                             or term in w.author.lower())
+            else:
+                # System lines etc. are noise while filtering
+                w.setVisible(not term)
 
     def _delete_message(self, mid: str):
         if not (self.worker and self.current_room):
@@ -2596,6 +2775,9 @@ class ChatWindow(QMainWindow):
         self._typers.clear()
         self._update_typing_label()
         self._cancel_edit()
+        self._cancel_reply()
+        self._reset_message_flow()
+        self._close_search()
         self.unread.pop(room, None)
         self._update_room_badges()
         self.worker.send_msg({"type": "join_room", "room": room})
@@ -2626,7 +2808,11 @@ class ChatWindow(QMainWindow):
         self._history_idx = -1
         self.msg_entry.clear()
         enc = self.fernet.encrypt(pad_plaintext(content.encode())).decode()
-        self.worker.send_msg({"type": "send_message", "room": self.current_room, "content": enc})
+        out = {"type": "send_message", "room": self.current_room, "content": enc}
+        if self._reply_to:
+            out["reply_to"] = self._reply_to
+            self._cancel_reply()
+        self.worker.send_msg(out)
 
     def _handle_slash_command(self, text: str):
         parts = text[1:].split()

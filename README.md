@@ -419,7 +419,7 @@ All messages are UTF-8 JSON objects. Every object has a `"type"` field.
 | `auth` | `server_password`, `username`, `password` | Must be the first message sent |
 | `join_room` | `room` | Enter a room and receive its user list (and replayed history/files); rejected if the user lacks access |
 | `leave_room` | `room` | Leave a room |
-| `send_message` | `room`, `content` | Broadcast an encrypted text message to a room |
+| `send_message` | `room`, `content`, optional `reply_to` (message id) | Broadcast an encrypted text message to a room |
 | `file_message` | `room`, `content` | Broadcast an encrypted file payload to a room |
 | `list_rooms` | — | Request the current room list |
 | `list_users` | `room` | Request the user list for a room |
@@ -440,7 +440,7 @@ All messages are UTF-8 JSON objects. Every object has a `"type"` field.
 | `auth_result` | `success` (bool), `message`, and on success `kdf_salt`, `rooms`, `max_file_mb`, `is_admin`, `roles` (name→colour), `your_roles` | Response to `auth` |
 | `rooms_list` | `rooms` (list); optionally `roles`, `your_roles` | Room list the user may access, sent on request or when rooms/roles change |
 | `users_list` | `room`, `users` (list), `user_roles` (name→roles), `roles` (name→colour) | User list for a room, with role badges |
-| `room_message` | `room`, `username`, `content`, `timestamp`, `historical` (bool) | Encrypted text message |
+| `room_message` | `room`, `username`, `content`, `timestamp`, `id`, `historical` (bool), optional `reply_to`, `edited`, `reactions` | Encrypted text message |
 | `file_message` | `room`, `username`, `content`, `timestamp`, `historical` (bool) | Encrypted file payload (replayed on join when persisted) |
 | `user_joined` | `room`, `username`, `roles` | Someone entered a room |
 | `user_left` | `room`, `username` | Someone left a room or disconnected |
